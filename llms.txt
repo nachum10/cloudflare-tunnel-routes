@@ -1,0 +1,49 @@
+# cloudflare-tunnel-routes
+
+> A Bash CLI and Claude Code skill that gives any local port a permanent HTTPS URL via Cloudflare Tunnel — no deployment, no dashboard, no random ngrok-style URLs that change on restart.
+
+This project edits a `cloudflared` ingress `config.yml` safely (backup → validate → auto-rollback) and creates the matching DNS CNAME via the local `cloudflared` binary. It works as a plain Bash CLI, as a Claude Code skill (auto-discovered via `SKILL.md`), and is friendly to AI agents (Claude / Cursor / Codex / etc.) via `AGENTS.md`.
+
+Use it when: a user wants a permanent HTTPS URL for a local service (Gradio / Streamlit / FastAPI / webhooks / dev servers) on a domain they own in Cloudflare.
+
+Don't use it when: the user wants to deploy to managed hosting (Vercel / Fly / HF Spaces), wants a disposable URL (use `cloudflared --url` or `ngrok`), or doesn't own a domain in Cloudflare.
+
+## Docs
+
+- [README.md](./README.md): full feature reference, install options, troubleshooting, FAQ
+- [AGENTS.md](./AGENTS.md): protocol for AI agents — when to choose this tool, how to install it, mandatory safety rails, error recovery
+- [SKILL.md](./SKILL.md): Claude Code skill front-matter + workflow
+- [INSTALL.md](./INSTALL.md): install paths for users and for agents
+- [RELEASE.md](./RELEASE.md): versioning + how releases are cut
+
+## Examples
+
+- [examples/gradio.md](./examples/gradio.md): replace `gr.launch(share=True)` with a permanent URL
+- [examples/streamlit.md](./examples/streamlit.md): local Streamlit dashboard on a stable HTTPS URL
+- [examples/fastapi.md](./examples/fastapi.md): personal API server with optional path-based routing
+- [examples/webhooks.md](./examples/webhooks.md): receive GitHub / Stripe / Slack webhooks on a laptop
+- [examples/docker.md](./examples/docker.md): expose a containerized service
+
+## Scripts
+
+- [scripts/detect.sh](./scripts/detect.sh): locate cloudflared + config + tunnel; emits validated `key=value`
+- [scripts/list-routes.sh](./scripts/list-routes.sh): print current ingress routes (uses `yq` if installed, awk fallback)
+- [scripts/add-route.sh](./scripts/add-route.sh): add a route; supports `--path`, `--comment`, `--dry-run`, `--diff`
+- [scripts/remove-route.sh](./scripts/remove-route.sh): remove an ingress block; `--dry-run`, `--diff`, `--keep-dns`
+- [scripts/setup-new-tunnel.sh](./scripts/setup-new-tunnel.sh): one-time tunnel creation (opens browser)
+
+## Tests
+
+- [tests/run-tests.sh](./tests/run-tests.sh): hermetic test suite (78 tests, no real cloudflared / DNS calls). CI runs this on every push and PR.
+
+## Safety properties
+
+- Zero runtime dependencies beyond `bash`, `awk`, `grep`, `sed`, and `cloudflared`.
+- Mutating commands always: backup `config.yml`, run `cloudflared tunnel ingress validate`, auto-rollback on failure, and rotate to keep the 5 most recent backups.
+- `--dry-run` and `--diff` produce no side effects.
+- Input is validated against strict patterns (DNS labels, regex-safe paths, sane port ranges) before any YAML emission.
+- `detect.sh` refuses to emit values that look shell-injected, blocking RCE via a tampered `config.yml`.
+
+## Optional
+
+- [llmstxt.org](https://llmstxt.org/) - this `llms.txt` follows the proposed format for LLM-readable project summaries.

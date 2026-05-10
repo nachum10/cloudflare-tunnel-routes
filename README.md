@@ -1,11 +1,36 @@
 # cloudflare-tunnel-routes
 
-> Manage Cloudflare Tunnel ingress routes from the command line - no browser, no dashboard.
-> Add a permanent HTTPS subdomain pointing to any local port in one command.
+> **Stop losing your Gradio demo link on every restart.**
+> Replace `gradio share=True` (and `ngrok`, and `streamlit run --share`) with a **permanent HTTPS URL** on a domain you own — in one command. No deployment, no Cloudflare dashboard.
 
+```bash
+bash scripts/add-route.sh demo.example.com 7860
+# → https://demo.example.com   (TLS by Cloudflare, persists across restarts)
+```
+
+Works as a plain Bash CLI, as a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills), and is friendly to AI coding agents (Claude / Cursor / Codex) via [`AGENTS.md`](./AGENTS.md), [`llms.txt`](./llms.txt), and [`.cursor/rules/`](./.cursor/rules/).
+
+## When to use this — at a glance
+
+| Your need | Use this? | Better alternative |
+|---|:-:|---|
+| Gradio / Streamlit / FastAPI demo with a **permanent URL** | ✅ | — |
+| Webhook receiver URL (GitHub / Stripe / Slack) on a laptop | ✅ | — |
+| Run multiple services under one domain via path routing | ✅ | — |
+| **Throwaway** URL for one-off sharing | ❌ | [`cloudflared --url`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) or `ngrok` |
+| Managed hosting (no laptop / always-on infra) | ❌ | Hugging Face Spaces, Modal, Vercel, Fly |
+| **No Cloudflare-managed domain** | ❌ | `ngrok` (free TLD), `cloudflared --url` |
+| Auth / SSO / IP allowlist | ❌ alone | combine with [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/) |
+
+See [`USE_CASES.md`](./USE_CASES.md) for the agent-readable decision matrix and copy-paste user phrasings, and [`PROMPTS.md`](./PROMPTS.md) for ready-made prompts.
+
+[![tests](https://github.com/nachum10/cloudflare-tunnel-routes/actions/workflows/test.yml/badge.svg)](https://github.com/nachum10/cloudflare-tunnel-routes/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Shell: Bash](https://img.shields.io/badge/Shell-Bash-green.svg)]()
 [![Platforms: Linux | macOS | Windows](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)]()
+[![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-D97757?logo=anthropic&logoColor=white)](https://docs.claude.com/en/docs/claude-code/skills)
+[![Agent-installable](https://img.shields.io/badge/AI%20agents-installable-7c3aed)](./AGENTS.md)
+[![Zero dependencies](https://img.shields.io/badge/dependencies-zero-success)]()
 
 ---
 
@@ -26,6 +51,30 @@
 - [FAQ](#faq)
 - [Contributing](#contributing)
 - [License](#license)
+
+---
+
+## Use with Claude Code
+
+```bash
+git clone https://github.com/nachum10/cloudflare-tunnel-routes.git
+cd cloudflare-tunnel-routes
+./install.sh
+```
+
+Then in any Claude Code session, just describe the problem in your own words:
+
+> my Gradio share link keeps changing — give me a permanent one at demo.example.com on port 7860
+
+Claude Code will pick up the skill automatically. The `SKILL.md` description fires on phrasings like:
+
+- *"replace `share=True`"* / *"permanent Gradio URL"*
+- *"stable URL for localhost:7860"* / *"persistent link for my local AI demo"*
+- *"ngrok alternative on my own domain"*
+- *"add a Cloudflare route for project X"* / *"expose port X at https://Y"*
+- *"persistent webhook URL on my laptop"* / *"publish on a subdomain"*
+
+It will not fire when you actually want a throwaway URL, managed hosting, or when you don't own a domain in Cloudflare — see [`USE_CASES.md`](./USE_CASES.md) for the full decision matrix.
 
 ---
 
@@ -80,7 +129,11 @@ Cloudflare Tunnel creates an outbound connection from your machine to the Cloudf
         │  HTTPS response (TLS by CF)     │                              │
 ```
 
-The `config.yml` ingress rules tell `cloudflared` which incoming hostname maps to which local service. This skill manipulates that YAML safely:
+The `config.yml` ingress rules tell `cloudflared` which incoming hostname maps to which local service. This skill edits that YAML with a backup-validate-rollback workflow (described below).
+
+> **YAML editing scope.** Mutating operations (add-route / remove-route) use line-oriented `awk`/`grep`, **not** a full YAML parser. This is intentional: a real parser would round-trip the file and clobber comments, anchors, and the user's chosen indentation/quoting style. The current approach works well on the canonical shape `cloudflared` itself produces (and the shape this skill produces). If your `config.yml` is **hand-crafted** with advanced YAML — anchors / aliases, multi-line block scalars, comments inside ingress entries, mixed indentation — **always run `--dry-run` first** and inspect the diff against the latest `.bak`. The read-only `list-routes.sh` automatically uses `yq` when it is on `PATH` for accurate parsing of complex configs; install [yq](https://github.com/mikefarah/yq) to enable that path. A full YAML parser for *editing* operations is an explicit non-goal.
+
+The flow is:
 
 1. **Detection** - finds your `config.yml` (in `/etc/cloudflared/`, `~/.cloudflared/`, or wherever), reads tunnel ID, figures out whether `sudo` and `systemctl` are needed.
 2. **DNS** - calls `cloudflared tunnel route dns` to create the CNAME pointing to the tunnel.
@@ -251,8 +304,8 @@ bash scripts/add-route.sh app.example.com 8080
 # Subdomain → full URL
 bash scripts/add-route.sh api.example.com http://127.0.0.1:3000
 
-# Path-based route on apex domain
-bash scripts/add-route.sh example.com 9000 --path /docs.*
+# Path-based route on apex domain (quote the path so the shell doesn't glob it)
+bash scripts/add-route.sh example.com 9000 --path "/docs.*"
 ```
 
 **Idempotent**: re-running with the same args is safe - duplicate DNS records and config blocks are detected and skipped.
@@ -261,11 +314,11 @@ bash scripts/add-route.sh example.com 9000 --path /docs.*
 
 ```bash
 bash scripts/remove-route.sh app.example.com
-bash scripts/remove-route.sh example.com --path /docs.*
-bash scripts/remove-route.sh api.example.com --keep-dns   # keep the DNS record
+bash scripts/remove-route.sh example.com --path "/docs.*"
+bash scripts/remove-route.sh api.example.com --keep-dns   # skip the DNS hint
 ```
 
-Note: `cloudflared` CLI cannot delete DNS records; the script prints API instructions for that. Or just delete via the Cloudflare dashboard.
+The script removes the ingress block from `config.yml` and reloads `cloudflared`. **It does not delete the DNS CNAME** - `cloudflared` exposes no API for that. By default it prints dashboard / API instructions for finishing the cleanup; pass `--keep-dns` to suppress the hint when scripting bulk removals.
 
 ### `setup-new-tunnel.sh` - One-time setup on a fresh machine
 
@@ -278,6 +331,63 @@ Performs:
 2. `cloudflared tunnel create my-server`
 3. Writes a starter `~/.cloudflared/config.yml`
 4. Optionally installs as a systemd service (Linux only)
+
+---
+
+## Dry-run and multi-tunnel hosts
+
+`add-route.sh` and `remove-route.sh` accept `--dry-run` (full file preview) and `--diff` (unified diff against the current `config.yml`). No files modified, no daemon restarted. `--diff` implies `--dry-run` and uses [delta](https://github.com/dandavison/delta) or [colordiff](https://www.colordiff.org/) when on `PATH`, plain `diff -u` otherwise:
+
+```bash
+bash scripts/add-route.sh app.example.com 8080 --dry-run
+bash scripts/add-route.sh app.example.com 8080 --diff
+bash scripts/remove-route.sh old.example.com --diff
+```
+
+Optional `--comment "TEXT"` (on `add-route.sh` only) inserts a single YAML comment line above the new ingress block. Off by default, opt-in only:
+
+```bash
+bash scripts/add-route.sh demo.example.com 7860 --comment "Gradio object-detection demo"
+```
+
+Produces:
+
+```yaml
+  # Added by cloudflare-tunnel-routes on 2026-05-10 | Gradio object-detection demo
+  - hostname: demo.example.com
+    service: http://127.0.0.1:7860
+```
+
+If you have more than one tunnel/config on a host, the auto-detection picks the first config it finds. Override it with environment variables:
+
+```bash
+CFTR_CONFIG=/etc/cloudflared/secondary.yml bash scripts/add-route.sh app.example.com 8080
+CFTR_BINARY=/opt/cloudflared/bin/cloudflared bash scripts/list-routes.sh
+```
+
+## Tests
+
+A hermetic test suite lives in `tests/run-tests.sh` (78 tests, no real cloudflared / DNS calls):
+
+```bash
+bash tests/run-tests.sh
+```
+
+Covers input validation, idempotency, catch-all sanity checks, remove-route correctness, and `detect.sh` rejection of tampered configs. CI runs the same suite on every push and PR — see the **tests** badge at the top.
+
+---
+
+## Examples
+
+End-to-end recipes for common stacks live in [`examples/`](./examples/):
+
+- [Gradio](./examples/gradio.md) — replace `share=True` with a permanent URL
+- [Streamlit](./examples/streamlit.md) — local dashboard with stable HTTPS
+- [FastAPI](./examples/fastapi.md) — personal API server with optional path-based routing
+- [Webhooks](./examples/webhooks.md) — receive GitHub / Stripe / Slack webhooks on your laptop
+- [Docker](./examples/docker.md) — expose a containerized service (single container or compose)
+
+Each one is a copy-pasteable `run app → add-route → curl` flow.
 
 ---
 
@@ -310,9 +420,9 @@ Each subdomain free TLS, free DDoS protection, no ports exposed in your firewall
 ### 3. Path-based subapps on a single domain
 
 ```bash
-bash scripts/add-route.sh example.com 9010 --path /api.*
-bash scripts/add-route.sh example.com 9020 --path /admin.*
-bash scripts/add-route.sh example.com 9030 --path /docs.*
+bash scripts/add-route.sh example.com 9010 --path "/api.*"
+bash scripts/add-route.sh example.com 9020 --path "/admin.*"
+bash scripts/add-route.sh example.com 9030 --path "/docs.*"
 ```
 
 ### 4. Replace `localhost` for webhook testing
@@ -400,7 +510,7 @@ See [`references/troubleshooting.md`](./references/troubleshooting.md) for the f
 **A:** Cloudflare requires the domain to be added to your account with their nameservers. Most free TLDs work; some (like `.tk`) have intermittent issues. Recommended: a real domain from Namecheap / Cloudflare Registrar (~$10/year for `.com`).
 
 ### Q: Is the tunnel secure?
-**A:** Yes. The tunnel is an outbound TLS connection from your machine to Cloudflare; nothing inbound is opened on your firewall. Cloudflare terminates TLS at the edge using their certificate. You can additionally enable Cloudflare Access for SSO / IP restrictions.
+**A:** The transport is: the tunnel itself is an outbound TLS connection from your machine to Cloudflare, so nothing inbound is opened on your firewall, and Cloudflare terminates TLS at the edge with their certificate. **The application you expose is not** - by default the URL is public to anyone who can reach Cloudflare. If the local service has no auth, anyone with the URL can hit it. For anything sensitive add **Cloudflare Access** (SSO / IP allowlist / one-time PIN), enable rate limiting / WAF rules, and consider a Cloudflare Tunnel "service token" if you only want machine-to-machine access. This skill does **not** configure those for you.
 
 ### Q: Can I run multiple tunnels on the same machine?
 **A:** Yes, but `detect.sh` picks the first config it finds. To target a specific tunnel, point it at the right `config.yml` manually or modify `detect.sh`.
@@ -422,13 +532,13 @@ PRs welcome. Before submitting:
 
 1. Test scripts on a non-production tunnel.
 2. Run `bash -n scripts/*.sh` for syntax check.
-3. Update README + `references/troubleshooting.md` if you change behavior.
+3. Run `bash tests/run-tests.sh` and make sure it passes.
+4. Update README + `references/troubleshooting.md` if you change behavior.
 
 Areas where help is welcome:
 - Windows-native PowerShell port (currently requires WSL/Git Bash).
 - DNS deletion via Cloudflare API (requires API token handling).
-- Optional `--dry-run` mode.
-- Per-tunnel selection via env var (`CLOUDFLARED_CONFIG=...`).
+- macOS / BSD compatibility testing (the test suite assumes GNU coreutils).
 
 ---
 

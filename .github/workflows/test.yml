@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax check
+        run: |
+          for f in scripts/*.sh tests/*.sh install.sh; do
+              bash -n "$f" || { echo "syntax error in $f"; exit 1; }
+          done
+          echo "syntax: OK"
+
+      - name: install yq (exercises yq codepath in list-routes.sh)
+        run: |
+          sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+              -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: run test suite
+        run: bash tests/run-tests.sh

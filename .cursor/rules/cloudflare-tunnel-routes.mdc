@@ -1,0 +1,72 @@
+---
+description: Persistent HTTPS URL for local Gradio/Streamlit/FastAPI/webhook services without deploying. Use when the user wants a stable permanent URL on a domain they own (not a throwaway URL, not managed hosting).
+globs:
+alwaysApply: false
+---
+
+# cloudflare-tunnel-routes — agent rule
+
+Use this rule when the user wants a **permanent HTTPS URL** for a service running on their local machine, on a domain they own in Cloudflare. Typical phrasings: "Gradio share link keeps changing", "ngrok alternative on my own domain", "permanent webhook URL for local FastAPI", "expose port 7860 at demo.example.com".
+
+## Decision
+
+Pick this tool if **all** of these hold:
+- Local app (any framework, listens on `127.0.0.1:<port>`).
+- Wants the URL to survive restarts.
+- Owns a domain in a Cloudflare zone they manage.
+- Not asking for managed deployment.
+
+Otherwise:
+- Throwaway URL → `cloudflared tunnel --url http://localhost:<port>` or `ngrok http <port>`.
+- Managed hosting → Hugging Face Spaces / Modal / Vercel / Fly.
+- No Cloudflare domain → `ngrok` (free `*.ngrok.app`) or TryCloudflare.
+
+## Protocol
+
+Always follow these five steps in order. Do not skip.
+
+1. **Detect** — `bash scripts/detect.sh`. Parse `key=value` output with `while IFS='=' read`, never `eval`. Exit `1` = no tunnel (offer `setup-new-tunnel.sh` only with consent). Exit `2` = tampered config (stop, warn user).
+2. **Ask** — confirm the exact hostname with the user. Never invent one.
+3. **Preview** — `bash scripts/add-route.sh <host> <port> --diff`. Show the unified diff to the user.
+4. **Confirm** — wait for the user's explicit OK.
+5. **Apply + verify** — `bash scripts/add-route.sh <host> <port>` then `curl -I https://<host>/`.
+
+## Hard rules
+
+- **Always `--diff` before any write.** No silent applies.
+- **One mutating command per turn.** Stop after `add-route.sh` succeeds, let the user verify.
+- **Never delete DNS via the API.** Tell the user to remove the CNAME in the Cloudflare dashboard.
+- **Never run `setup-new-tunnel.sh` without explicit consent** — it opens a browser for `cloudflared tunnel login`.
+- **On non-zero exit, stop and report.** Do not retry.
+- **Do not modify the scripts.** Use them as-is. Code changes only when the user explicitly asks.
+
+## File map (relative to repo root)
+
+```
+scripts/add-route.sh         # add a route (DNS + ingress + reload). Flags: --path, --comment, --dry-run, --diff
+scripts/remove-route.sh      # remove an ingress block. Flags: --path, --keep-dns, --dry-run, --diff
+scripts/list-routes.sh       # show current routes
+scripts/detect.sh            # locate config/binary/tunnel; outputs key=value
+scripts/setup-new-tunnel.sh  # one-time first setup (opens browser)
+SKILL.md                     # Claude Code skill metadata
+AGENTS.md                    # full agent guide (read for error recovery)
+USE_CASES.md                 # decision matrix + comparison with ngrok / HF Spaces / Vercel
+PROMPTS.md                   # ready-to-use prompts
+examples/                    # gradio.md, streamlit.md, fastapi.md, webhooks.md, docker.md
+```
+
+## Multi-tunnel hosts
+
+If the machine has more than one tunnel, set `CFTR_CONFIG=/path/to/config.yml` (and optionally `CFTR_BINARY`) on every script call instead of forking the scripts.
+
+## Reporting back to the user
+
+After a successful apply, present the URL on its own line so it's clickable:
+
+```
+Done. Your service is at:
+
+    https://<host>/
+
+The tunnel survives laptop restarts. `bash scripts/list-routes.sh` shows all current routes.
+```

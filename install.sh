@@ -15,6 +15,10 @@ elif [ -d "$TARGET_DIR" ]; then
     echo "ERROR: $TARGET_DIR exists and is a real directory (not a symlink)."
     echo "       Remove it manually first if you want to replace it."
     exit 1
+elif [ -e "$TARGET_DIR" ]; then
+    echo "ERROR: $TARGET_DIR exists and is a regular file (not a symlink)."
+    echo "       Remove it manually first if you want to replace it."
+    exit 1
 fi
 
 mkdir -p "$(dirname "$TARGET_DIR")"

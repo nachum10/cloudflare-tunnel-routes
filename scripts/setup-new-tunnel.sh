@@ -9,6 +9,7 @@
 #   4. Optionally installs as systemd service
 
 set -eu
+export LC_ALL=C
 
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <tunnel-name>"
@@ -93,8 +94,14 @@ if [ "$(uname)" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
     if [ "${ans,,}" = "y" ]; then
         # systemd service runs as root and reads /etc/cloudflared/config.yml
         sudo mkdir -p /etc/cloudflared
+        sudo chmod 0755 /etc/cloudflared
         sudo cp "$config_path" /etc/cloudflared/config.yml
+        sudo chmod 0644 /etc/cloudflared/config.yml
         sudo cp "$credentials_file" /etc/cloudflared/
+        # Tunnel credentials are bearer-equivalent secrets; lock them down
+        # regardless of the source umask.
+        sudo chown root:root "/etc/cloudflared/$(basename "$credentials_file")"
+        sudo chmod 0600 "/etc/cloudflared/$(basename "$credentials_file")"
         sudo cloudflared service install
         sudo systemctl enable --now cloudflared
         echo "==> Service installed. Status:"
