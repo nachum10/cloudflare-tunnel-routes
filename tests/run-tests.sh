@@ -521,15 +521,26 @@ assert_contains "awk fallback shows simple hostname" "simple.example.com" "$out"
 assert_contains "awk fallback shows hostname+path" "api.example.com" "$out"
 assert_contains "awk fallback shows path column" "/v1" "$out"
 
-# yq path - only run if /tmp/yq is available (test scaffolding can install it)
-if [ -x /tmp/yq ]; then
-    out="$(PATH="/tmp:$PATH" run_list)"
+# yq path - runs when yq is on PATH (CI installs a pinned, checksummed one)
+# or at /tmp/yq. Only yq itself is linked into a private dir, so /tmp never
+# lands on PATH.
+yq_bin="$(command -v yq 2>/dev/null || true)"
+if [ -z "$yq_bin" ] && [ -x /tmp/yq ]; then
+    yq_bin=/tmp/yq
+fi
+yq_dir="$work_dir/yq-bin"
+if [ -n "$yq_bin" ]; then
+    mkdir -p "$yq_dir"
+    ln -sf "$yq_bin" "$yq_dir/yq"
+fi
+if [ -n "$yq_bin" ]; then
+    out="$(PATH="$yq_dir:$PATH" run_list)"
     assert_contains "yq path shows simple hostname" "simple.example.com" "$out"
     assert_contains "yq path shows api with path" "/v1" "$out"
     # yq path correctly surfaces the catch-all (awk fallback misses it)
     assert_contains "yq path surfaces catch-all" "http_status:404" "$out"
 else
-    echo "  SKIP  yq not at /tmp/yq - download it to enable yq-path tests"
+    echo "  SKIP  yq not on PATH or at /tmp/yq - install it to enable yq-path tests"
 fi
 
 # YAML with quoted strings + inline comments
@@ -542,8 +553,8 @@ ingress:
     service: "http://localhost:8080"   # inline comment
   - service: http_status:404
 EOF
-if [ -x /tmp/yq ]; then
-    out="$(PATH="/tmp:$PATH" run_list)"
+if [ -n "$yq_bin" ]; then
+    out="$(PATH="$yq_dir:$PATH" run_list)"
     assert_contains "yq strips quotes from hostname" "quoted.example.com" "$out"
     assert_contains "yq keeps regex path intact" "/api/v[12]/.*" "$out"
     # The inline comment must NOT leak into the service column
