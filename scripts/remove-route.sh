@@ -6,23 +6,27 @@
 # The DNS CNAME is NOT deleted automatically - cloudflared has no API for
 # that - the script prints instructions for the dashboard / Cloudflare API.
 # Pass --keep-dns to suppress that hint (e.g. when scripting bulk cleanups).
+#
+# Exit status: 0 = done (or nothing matched), 1 = failed (config unchanged
+#              or restored), 3 = config updated but cloudflared NOT
+#              reloaded (no unique systemd unit for this config).
 
-set -eu
+set -euo pipefail
 export LC_ALL=C
 
 show_preview() {
     local orig="$1" new="$2"
     if [ "$show_diff" = "true" ]; then
         if command -v delta >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
         elif command -v colordiff >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
         else
-            $SUDO diff -u "$orig" "$new" 2>/dev/null || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null || true
         fi
     else
         echo "----- 8< -----"
-        $SUDO cat "$new"
+        $RSUDO cat "$new"
         echo "----- >8 -----"
     fi
 }
@@ -70,17 +74,23 @@ if [ -n "$path" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib.sh
+. "$SCRIPT_DIR/lib.sh"
 
 binary=""; config=""; tunnel_id=""; credentials=""; needs_sudo=""; service_mode=""
+service_unit=""; service_candidates=""; remote_managed=""
 detect_out="$(bash "$SCRIPT_DIR/detect.sh")" || {
     rc=$?
     if [ "$rc" = "2" ]; then
         echo "ERROR: detect.sh refused to emit values - config may be tampered." >&2
+    elif [ "$rc" = "3" ]; then
+        : # detect.sh already printed the "needs root" error
     else
         echo "ERROR: No cloudflared tunnel detected." >&2
     fi
     exit 1
 }
+# shellcheck disable=SC2034  # every key is parsed; not all are used here
 while IFS='=' read -r k v; do
     case "$k" in
         binary)       binary="$v" ;;
@@ -89,6 +99,9 @@ while IFS='=' read -r k v; do
         credentials)  credentials="$v" ;;
         needs_sudo)   needs_sudo="$v" ;;
         service_mode) service_mode="$v" ;;
+        service_unit) service_unit="$v" ;;
+        service_candidates) service_candidates="$v" ;;
+        remote_managed) remote_managed="$v" ;;
     esac
 done <<<"$detect_out"
 
@@ -96,148 +109,140 @@ SUDO=""
 if [ "$needs_sudo" = "true" ]; then
     SUDO="sudo"
 fi
-
-backup="${config}.bak.$(date +%Y%m%d-%H%M%S)"
-[ "$dry_run" = "true" ] && echo "==> DRY RUN: no changes will be made"
-if [ "$dry_run" = "true" ]; then
-    echo "==> [dry-run] would: backup $config to $backup"
-else
-    echo "==> Backing up config to $backup"
-    $SUDO cp "$config" "$backup"
-
-    # Keep only the 5 most recent backups (mirrors add-route.sh)
-    rotate_backups() {
-        # shellcheck disable=SC2012
-        local stale
-        mapfile -t stale < <($SUDO ls -1t "${config}".bak.* 2>/dev/null | tail -n +6) || true
-        if [ "${#stale[@]}" -gt 0 ]; then
-            $SUDO rm -f -- "${stale[@]}"
-        fi
-    }
-    rotate_backups
+# Reads need root only when the config itself is unreadable (see add-route).
+RSUDO=""
+if [ -n "$SUDO" ] && [ ! -r "$config" ]; then
+    RSUDO="$SUDO"
 fi
 
-echo "==> Removing ingress block for $hostname${path:+ + path $path}..."
-tmp="$(mktemp)"
+# All writes go to the real file behind $config (it may be a symlink).
+config_file="$(cftr_real_path "$config")" || {
+    echo "ERROR: cannot resolve symlinks for $config" >&2
+    exit 1
+}
 
-# AWK: walk blocks of `- hostname: X` ... up to next `- hostname:` or end-of-list.
-# Skip the block if hostname matches AND (no --path given OR path matches).
-# After a skip, also swallow one trailing blank line so config stays tidy.
-$SUDO awk -v h="$hostname" -v p="$path" '
-    function flush() {
-        if (skip) {
-            skip = 0; n = 0
-            just_removed = 1
-            return
+tmp=""; staged=""
+on_exit() {
+    local rc=$?
+    [ -n "$tmp" ] && rm -f -- "$tmp"
+    [ -n "$staged" ] && $SUDO rm -f -- "$staged"
+    cftr_lock_release
+    return "$rc"
+}
+trap on_exit EXIT
+
+# Real runs: trustworthy binary for the root-run validate, and an
+# exclusive lock from the first read of the config to the restart.
+if [ "$dry_run" != "true" ]; then
+    cftr_check_sudo || exit 1
+    cftr_check_binary || exit 1
+    cftr_lock_acquire || exit 1
+    cftr_remember_config || exit 1
+fi
+
+[ "$dry_run" = "true" ] && echo "==> DRY RUN: no changes will be made"
+if [ "$remote_managed" = "true" ]; then
+    echo "WARN: ${service_unit:-the cloudflared unit} runs 'tunnel run --token' (remotely-managed tunnel);" >&2
+    echo "      local ingress rules are ignored - manage routes in the Zero Trust dashboard." >&2
+fi
+echo "==> Removing ingress block for $hostname${path:+ + path $path}..."
+
+# Pick the blocks to drop (see cftr_route_blocks in lib.sh): hostname
+# matches AND (no --path given OR path matches). A block runs until the
+# next line at its dash indent or less, so comments, originRequest maps
+# and nested Access lists inside it go with it - and nothing leaks into
+# the neighbouring routes. Strings are compared in bash, never as regex.
+ranges=""
+while IFS=$'\t' read -r b_start b_end _ b_host b_path; do
+    [ "$b_host" = "$hostname" ] || continue
+    if [ -z "$path" ] || [ "$b_path" = "$path" ]; then
+        ranges="$ranges $b_start:$b_end"
+    fi
+done < <(cftr_route_blocks "$config")
+
+tmp="$(mktemp)"
+# Drop the chosen line ranges; after each, also swallow one trailing
+# blank line so the config stays tidy.
+$RSUDO env cftr_ranges="$ranges" awk '
+    BEGIN {
+        n = split(ENVIRON["cftr_ranges"], r, " ")
+        for (i = 1; i <= n; i++) {
+            split(r[i], se, ":")
+            for (l = se[1] + 0; l <= se[2] + 0; l++) drop[l] = 1
+            after[se[2] + 1] = 1
         }
-        for (i = 1; i <= n; i++) print buf[i]
-        n = 0
     }
-    /^[[:space:]]*-[[:space:]]*hostname:/ {
-        # Decide whether the buffered block (if any) should be skipped
-        # BEFORE flushing - otherwise consecutive blocks for the same
-        # hostname all leak through.
-        if (in_block) {
-            if (p == "" || p == cur_path) skip = 1
-            in_block = 0
-        }
-        flush()
-        just_removed = 0
-        cur = $NF; gsub(/["'"'"']/, "", cur)
-        cur_path = ""
-        in_block = (cur == h)
-        n = 1; buf[n] = $0
-        next
-    }
-    in_block && /^[[:space:]]+path:/ {
-        cur_path = $NF; gsub(/["'"'"']/, "", cur_path)
-        n++; buf[n] = $0
-        next
-    }
-    in_block && /^[[:space:]]+[^-[:space:]#]/ {
-        # Indented continuation of the block, but NOT:
-        #   - the start of a new list item (`  - ...`)
-        #   - a comment line (`  # ...`) - comments between blocks must
-        #     never be swallowed into the deletion buffer; let them fall
-        #     through to the default block, which closes the current
-        #     block first and then prints the comment.
-        n++; buf[n] = $0
-        next
-    }
-    {
-        # End of any block: decide whether to skip the buffered block
-        if (in_block) {
-            if (p == "" || p == cur_path) skip = 1
-            in_block = 0
-        }
-        # flush() MUST be called for every non-hostname line so buf drains
-        # correctly. flush() sets just_removed=1 if it discarded a skipped block.
-        flush()
-        # Swallow a blank line that immediately follows a removed block
-        if (just_removed && /^[[:space:]]*$/) {
-            just_removed = 0
-            next
-        }
-        just_removed = 0
-        print
-    }
-    END { flush() }
+    NR in drop { next }
+    (NR in after) && /^[[:space:]]*$/ { next }
+    { print }
 ' "$config" > "$tmp"
 
-if [ "$dry_run" = "true" ]; then
-    if diff -q "$config" "$tmp" >/dev/null 2>&1; then
+if [ -z "$ranges" ]; then
+    if [ "$dry_run" = "true" ]; then
         echo "    [dry-run] no matching entry - config unchanged."
+        echo "==> [dry-run] no changes made."
     else
-        if [ "$show_diff" = "true" ]; then
-            echo "    [dry-run] diff against $config:"
-        else
-            echo "    [dry-run] would write the following to $config:"
-        fi
-        show_preview "$config" "$tmp"
+        echo "    No matching entry found in config - nothing to do."
     fi
-    rm -f "$tmp"
+    exit 0
+fi
+
+if [ "$dry_run" = "true" ]; then
+    if [ "$show_diff" = "true" ]; then
+        echo "    [dry-run] diff against $config:"
+    else
+        echo "    [dry-run] would write the following to $config:"
+    fi
+    show_preview "$config" "$tmp"
     echo
-    echo "==> [dry-run] would: validate config + restart cloudflared ($service_mode)"
+    echo "==> [dry-run] would: validate, backup $config, replace it, restart cloudflared ($service_mode${service_unit:+: $service_unit})"
     echo "==> [dry-run] no changes made."
     exit 0
 fi
 
-if ! diff -q "$config" "$tmp" >/dev/null 2>&1; then
-    $SUDO cp "$tmp" "$config"
-    echo "    Removed."
-else
-    echo "    No matching entry found in config."
-fi
-rm -f "$tmp"
-
-# Validate
-echo "==> Validating config..."
-if ! $SUDO "$binary" --config "$config" tunnel ingress validate 2>&1; then
-    echo "ERROR: Config invalid - restoring backup." >&2
-    $SUDO cp "$backup" "$config"
+# Stage next to the config with the original owner/group/mode, validate
+# the staged file, back up, then swap it in with an atomic rename.
+cfg_meta="$(cftr_file_meta "$config")" || {
+    echo "ERROR: cannot stat $config" >&2
+    exit 1
+}
+read -r cfg_uid cfg_gid cfg_mode <<<"$cfg_meta"
+staged="$(cftr_stage "$tmp" "$cfg_uid" "$cfg_gid" "$cfg_mode")" || {
+    staged=""
+    echo "ERROR: could not stage the new config next to $config - nothing changed." >&2
+    exit 1
+}
+echo "==> Validating new config..."
+if ! $SUDO "$binary" --config "$staged" tunnel ingress validate 2>&1; then
+    echo "ERROR: Config invalid - nothing changed." >&2
     exit 1
 fi
+backup="$(cftr_backup)" || {
+    echo "ERROR: could not back up $config - config untouched." >&2
+    exit 1
+}
+echo "==> Backed up config to $backup"
+cftr_rotate_backups
+cftr_assert_config_unchanged || exit 1
+$SUDO mv -f -- "$staged" "$config_file"
+staged=""
+echo "    Removed."
 
-# Restart
-echo "==> Restarting cloudflared ($service_mode)..."
-case "$service_mode" in
-    systemd) $SUDO systemctl restart cloudflared ;;
-    manual)
-        cf_pids=()
-        while read -r pid; do
-            [ -z "$pid" ] && continue
-            comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
-            [ "$comm" = "cloudflared" ] || continue
-            args="$($SUDO ps -o args= -p "$pid" 2>/dev/null || true)"
-            case "$args" in
-                *"$tunnel_id"*|*"$config"*) cf_pids+=("$pid") ;;
-            esac
-        done < <($SUDO pgrep -f 'cloudflared.*tunnel.*run' 2>/dev/null || true)
-        if [ "${#cf_pids[@]}" -gt 0 ]; then
-            $SUDO kill -HUP "${cf_pids[@]}" || true
-        fi
-        ;;
-esac
+# Restart the unit that serves THIS config; roll back if it won't start.
+reload_rc=0
+cftr_reload || reload_rc=$?
+if [ "$reload_rc" -eq 1 ]; then
+    echo "ERROR: restoring previous config from $backup" >&2
+    if staged="$(cftr_stage "$backup" "$cfg_uid" "$cfg_gid" "$cfg_mode")"; then
+        $SUDO mv -f -- "$staged" "$config_file"
+        staged=""
+        cftr_reload || echo "ERROR: restart after restore failed too - check the service manually." >&2
+    else
+        staged=""
+        echo "ERROR: could not restore automatically; copy $backup over $config by hand." >&2
+    fi
+    exit 1
+fi
 
 # Remove DNS unless --keep-dns
 if [ "$keep_dns" = "false" ]; then
@@ -251,4 +256,8 @@ if [ "$keep_dns" = "false" ]; then
 fi
 
 echo
+if [ "$reload_rc" -eq 3 ]; then
+    echo "==> Config written, but NOT live until cloudflared restarts (exit 3)." >&2
+    exit 3
+fi
 echo "==> Done."

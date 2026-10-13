@@ -26,13 +26,13 @@ ci: lint test
 
 docs-check:
 	@missing=0; \
-	for f in README.md SKILL.md AGENTS.md INSTALL.md RELEASE.md \
+	for f in README.md SKILL.md AGENTS.md INSTALL.md RELEASE.md CHANGELOG.md \
 	         USE_CASES.md PROMPTS.md llms.txt LICENSE \
 	         .cursor/rules/cloudflare-tunnel-routes.mdc \
 	         examples/gradio.md examples/streamlit.md examples/fastapi.md \
 	         examples/webhooks.md examples/docker.md \
 	         scripts/detect.sh scripts/add-route.sh scripts/remove-route.sh \
-	         scripts/list-routes.sh scripts/setup-new-tunnel.sh \
+	         scripts/list-routes.sh scripts/setup-new-tunnel.sh scripts/lib.sh \
 	         tests/run-tests.sh references/troubleshooting.md; do \
 	    if [ ! -e "$$f" ]; then echo "MISSING: $$f"; missing=$$((missing+1)); fi; \
 	done; \

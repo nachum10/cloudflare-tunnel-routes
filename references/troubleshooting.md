@@ -11,9 +11,9 @@ Check:
 
 ## "An A, AAAA, or CNAME record with that host already exists"
 
-A non-tunnel DNS record (e.g. an A record from before) is blocking the CNAME. Two options:
+A non-tunnel DNS record (e.g. an A record from before) is blocking the CNAME. `add-route.sh` stops with exit 1 and leaves `config.yml` untouched. Two options:
 1. Delete the conflicting record in Cloudflare dashboard, then re-run `add-route.sh`.
-2. Use the API to overwrite it (advanced).
+2. If you are sure the name should move to this tunnel, run the command the script printed yourself (`cloudflared tunnel route dns --overwrite-dns <tunnel> <hostname>`), then re-run `add-route.sh`. The script never overwrites DNS on its own.
 
 ## "tunnel <id> not found" / "credentials file not found"
 
@@ -27,9 +27,10 @@ Fix: run `cloudflared tunnel list` to see existing tunnels, then either re-creat
 
 Possible causes:
 1. **DNS propagation lag** - wait 30-60 seconds, retry.
-2. **Cloudflared didn't restart** - check `systemctl status cloudflared` (systemd) or `pgrep -af cloudflared` (manual). The script logs the restart step; look for errors.
-3. **Path conflict** - if you added a path-based route on a hostname that also has a hostname-only route above it, the hostname-only one wins. Reorder `config.yml` so the more-specific (path-based) entry comes FIRST.
-4. **Wrong upstream port** - test locally: `curl -I http://127.0.0.1:<port>`.
+2. **Cloudflared didn't restart** - if the script exited with status 3, it wrote the config but could not tell which cloudflared to restart (several systemd units use this config, or cloudflared runs by hand). Restart it as printed, or re-run with `CFTR_SERVICE=<unit>`. Otherwise check `systemctl status <unit>` (systemd) or `pgrep -af cloudflared` (manual).
+3. **Path conflict** - a hostname-only rule above a path-based rule for the same hostname wins. `add-route.sh` now inserts new `--path` rules above an existing hostname-only rule, but older or hand-edited configs may still have the wrong order: move the more-specific (path-based) entry FIRST.
+4. **Remotely-managed tunnel** - if the unit runs `cloudflared tunnel run --token ...`, cloudflared ignores the local `ingress:` list (the scripts warn about this). Manage routes in the Zero Trust dashboard instead.
+5. **Wrong upstream port** - test locally: `curl -I http://127.0.0.1:<port>`.
 
 ## "context deadline exceeded" / "no healthy origins"
 
@@ -59,7 +60,19 @@ The detection script sets `needs_sudo=true` automatically and the helper scripts
 3. `~/.cloudflared/config.yml`
 4. `~/.cloudflared/config.yaml`
 
-To target a non-default tunnel, set the env var `CLOUDFLARED_CONFIG=/path/to/other.yml` before running the scripts (then modify `detect.sh` to honour it - currently a TODO if needed).
+To target a non-default tunnel, set `CFTR_CONFIG=/path/to/other.yml` (and, if needed, `CFTR_BINARY=/path/to/cloudflared`) when running the scripts. They restart only the systemd unit whose `ExecStart` passes that config via `--config`; if none or several match, nothing is restarted and they exit 3. Name the unit with `CFTR_SERVICE=<unit>` in that case.
+
+## "needs root: re-run in a terminal or with sudo"
+
+The config is readable only by root and `sudo` needs a password, but there is no terminal to type it into (e.g. an AI agent or CI running the script). `detect.sh` uses `sudo -n` there instead of hanging on a hidden prompt, and exits 3. Run the command yourself in a terminal, or with `sudo`.
+
+## "refusing to run ... as root"
+
+When the config needs `sudo`, the scripts run `cloudflared tunnel ingress validate` as root. They refuse unless the `cloudflared` binary (after following symlinks) is owned by root and not group- or world-writable, because anyone able to rewrite it would otherwise get root. Install `cloudflared` from the official packages (owned by root), or fix the ownership/permissions.
+
+## "another cftr run holds the lock"
+
+Only one `add-route.sh` / `remove-route.sh` may change a config at a time. Wait for the other run to finish. Where `flock` is missing (macOS) the lock is a directory `config.yml.lock.d` next to the config; if a crashed run left it behind and nothing else is running, remove that directory.
 
 ## How to remove a DNS CNAME (the script can't)
 

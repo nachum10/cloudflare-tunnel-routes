@@ -7,12 +7,19 @@
 #   add-route.sh api.example.com http://127.0.0.1:3000
 #   add-route.sh example.com 9015 --path /myapp
 #
-# Steps performed:
-#   1. Create DNS CNAME via `cloudflared tunnel route dns`
-#   2. Insert ingress block into config.yml BEFORE the catch-all 404
-#   3. Reload/restart cloudflared
+# Steps performed (each one only if the previous succeeded):
+#   1. Build the new config in a temp file (block inserted BEFORE the
+#      catch-all 404, or above a host-only rule it would be shadowed by)
+#   2. Validate it with `cloudflared tunnel ingress validate`
+#   3. Create DNS CNAME via `cloudflared tunnel route dns`
+#   4. Back up config.yml, then replace it atomically (owner/mode kept)
+#   5. Restart the systemd unit serving this config; roll back on failure
+#
+# Exit status: 0 = done, 1 = failed (config unchanged or restored),
+#              3 = config updated but cloudflared NOT reloaded (no unique
+#                  systemd unit for this config) - restart it yourself.
 
-set -eu
+set -euo pipefail
 export LC_ALL=C
 
 # show_preview <original-file> <proposed-file>
@@ -22,15 +29,15 @@ show_preview() {
     local orig="$1" new="$2"
     if [ "$show_diff" = "true" ]; then
         if command -v delta >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
         elif command -v colordiff >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
         else
-            $SUDO diff -u "$orig" "$new" 2>/dev/null || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null || true
         fi
     else
         echo "----- 8< -----"
-        $SUDO cat "$new"
+        $RSUDO cat "$new"
         echo "----- >8 -----"
     fi
 }
@@ -94,13 +101,19 @@ fi
 
 # Comment: optional, opt-in only. Reject newlines (which would break out of
 # the comment line in YAML) and cap length so a stray paragraph doesn't end
-# up inline.
+# up inline. Beyond \n and \r, YAML parsers also break lines on NEL (U+0085),
+# LS (U+2028) and PS (U+2029), so a "single-line" comment could still smuggle
+# in a hidden ingress rule. Allow printable ASCII only ([[:print:]] under
+# LC_ALL=C is 0x20-0x7E): no control chars, no bytes >= 0x80.
 if [ -n "$comment" ]; then
     case "$comment" in
         *$'\n'*|*$'\r'*)
             echo "ERROR: --comment cannot contain newlines." >&2; exit 1
             ;;
     esac
+    if ! [[ "$comment" =~ ^[[:print:]]+$ ]]; then
+        echo "ERROR: --comment must be printable ASCII (no control or non-ASCII characters)." >&2; exit 1
+    fi
     if [ "${#comment}" -gt 200 ]; then
         echo "ERROR: --comment too long (>200 chars). Keep it short." >&2; exit 1
     fi
@@ -110,7 +123,8 @@ fi
 # allow regex/glob metacharacters (.*, +, ?, [, ], etc.). Validate by
 # rejecting only what would break the YAML emission or be otherwise
 # nonsensical: control chars, whitespace, quotes, '#' (yaml comment),
-# ':' (yaml key separator).
+# ':' (yaml key separator), and anything outside printable ASCII (YAML
+# treats NEL / U+2028 / U+2029 as line breaks, same as in --comment).
 if [ -n "$path" ]; then
     if [[ "$path" != /* ]]; then
         echo "ERROR: --path must start with /" >&2; exit 1
@@ -126,6 +140,10 @@ if [ -n "$path" ]; then
             exit 1
             ;;
     esac
+    if ! [[ "$path" =~ ^[[:print:]]+$ ]]; then
+        echo "ERROR: invalid --path: must be printable ASCII (no control or non-ASCII characters)." >&2
+        exit 1
+    fi
 fi
 
 # Target: bare port number, full http(s) URL, or host:port. Reject anything
@@ -146,19 +164,25 @@ else
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib.sh
+. "$SCRIPT_DIR/lib.sh"
 
 # Parse detect.sh output WITHOUT eval (config.yml is partly user-controlled).
 binary=""; config=""; tunnel_id=""; credentials=""; needs_sudo=""; service_mode=""
+service_unit=""; service_candidates=""; remote_managed=""
 detect_out="$(bash "$SCRIPT_DIR/detect.sh")" || {
     rc=$?
     if [ "$rc" = "2" ]; then
         echo "ERROR: detect.sh refused to emit values - config may be tampered." >&2
+    elif [ "$rc" = "3" ]; then
+        : # detect.sh already printed the "needs root" error
     else
         echo "ERROR: No cloudflared tunnel detected." >&2
         echo "Run setup-new-tunnel.sh to create one first." >&2
     fi
     exit 1
 }
+# shellcheck disable=SC2034  # every key is parsed; not all are used here
 while IFS='=' read -r k v; do
     case "$k" in
         binary)       binary="$v" ;;
@@ -167,6 +191,9 @@ while IFS='=' read -r k v; do
         credentials)  credentials="$v" ;;
         needs_sudo)   needs_sudo="$v" ;;
         service_mode) service_mode="$v" ;;
+        service_unit) service_unit="$v" ;;
+        service_candidates) service_candidates="$v" ;;
+        remote_managed) remote_managed="$v" ;;
     esac
 done <<<"$detect_out"
 
@@ -174,69 +201,77 @@ SUDO=""
 if [ "$needs_sudo" = "true" ]; then
     SUDO="sudo"
 fi
+# Reads need root only when the config itself is unreadable. A typical
+# root-owned but world-readable /etc/cloudflared/config.yml can then be
+# previewed (--diff) without any sudo at all.
+RSUDO=""
+if [ -n "$SUDO" ] && [ ! -r "$config" ]; then
+    RSUDO="$SUDO"
+fi
+
+# All writes go to the real file behind $config (it may be a symlink).
+config_file="$(cftr_real_path "$config")" || {
+    echo "ERROR: cannot resolve symlinks for $config" >&2
+    exit 1
+}
 
 echo "==> Tunnel: $tunnel_id"
 echo "==> Config: $config"
 echo "==> Adding: $hostname${path:+ (path: $path)} -> $service"
 [ "$dry_run" = "true" ] && echo "==> DRY RUN: no changes will be made"
+if [ "$remote_managed" = "true" ]; then
+    echo "WARN: ${service_unit:-the cloudflared unit} runs 'tunnel run --token' (remotely-managed tunnel)." >&2
+    echo "      cloudflared then ignores the ingress rules in $config; manage routes in the" >&2
+    echo "      Cloudflare Zero Trust dashboard instead." >&2
+fi
 echo
 
-# Step 1: Create DNS record
-# Skips quietly if record already exists (cloudflared returns specific error).
-if [ "$dry_run" = "true" ]; then
-    echo "==> [dry-run] would: $binary tunnel route dns $tunnel_id $hostname"
-else
-    echo "==> Creating DNS CNAME for $hostname..."
-    dns_log="$(mktemp)"
-    trap 'rm -f "$dns_log"' EXIT
-    if ! "$binary" tunnel route dns "$tunnel_id" "$hostname" 2>&1 | tee "$dns_log"; then
-        if grep -qiE "already exists|record with that host already exists" "$dns_log"; then
-            echo "    (DNS record already exists - continuing)"
-        else
-            echo "ERROR: Failed to create DNS record" >&2
-            exit 1
-        fi
+# One EXIT handler for every temp file, plus the orphan-DNS hint: if the
+# CNAME was created but a later step failed, say how to remove it. We
+# never delete DNS records ourselves.
+tmp=""; staged=""; dns_log=""; dns_done="false"; host_known="false"
+on_exit() {
+    local rc=$?
+    [ -n "$tmp" ] && rm -f -- "$tmp"
+    [ -n "$dns_log" ] && rm -f -- "$dns_log"
+    [ -n "$staged" ] && $SUDO rm -f -- "$staged"
+    cftr_lock_release
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ "$dns_done" = "true" ] && [ "$host_known" = "false" ]; then
+        echo >&2
+        echo "NOTE: the DNS CNAME for $hostname was created, but the config change did not go live." >&2
+        echo "      If you will not retry, delete that CNAME in the Cloudflare dashboard" >&2
+        echo "      (your zone -> DNS -> Records -> $hostname -> Delete)." >&2
     fi
-fi
-
-# Step 2: Backup config and insert ingress block before the catch-all
-backup="${config}.bak.$(date +%Y%m%d-%H%M%S)"
-echo
-if [ "$dry_run" = "true" ]; then
-    echo "==> [dry-run] would: backup $config to $backup"
-else
-    echo "==> Backing up config to $backup"
-    $SUDO cp "$config" "$backup"
-fi
-
-# Keep only the 5 most recent backups - .bak files contain the credentials
-# path and accumulate every run.
-rotate_backups() {
-    # shellcheck disable=SC2012
-    local stale
-    mapfile -t stale < <($SUDO ls -1t "${config}".bak.* 2>/dev/null | tail -n +6) || true
-    if [ "${#stale[@]}" -gt 0 ]; then
-        $SUDO rm -f -- "${stale[@]}"
-    fi
+    return "$rc"
 }
-rotate_backups
+trap on_exit EXIT
 
-# Sanity check: the awk insertion below pivots on a SINGLE catch-all line
-# (`service: http_status:404`). If the file has zero or multiple, the
-# awk would either silently no-op (producing an unchanged file that
-# still passes `tunnel ingress validate`) or duplicate the new block.
-# Detect that up front and refuse with a clear error.
-catchall_count="$($SUDO grep -cE '^[[:space:]]*(-[[:space:]]+)?service:[[:space:]]*http_status:404[[:space:]]*$' "$config" || true)"
-if [ "$catchall_count" != "1" ]; then
-    echo "ERROR: expected exactly one 'service: http_status:404' catch-all in $config, found $catchall_count." >&2
+# A real run holds an exclusive lock from the first read of the config to
+# the restart, so two concurrent runs can never interleave their edits.
+# Running "$binary" as root (validate) needs a trustworthy binary.
+if [ "$dry_run" != "true" ]; then
+    cftr_check_sudo || exit 1
+    cftr_check_binary || exit 1
+    cftr_lock_acquire || exit 1
+    cftr_remember_config || exit 1
+fi
+
+# Sanity check: the insertion pivots on a SINGLE catch-all line. With zero
+# or several, the edit would silently no-op (an unchanged file still passes
+# `tunnel ingress validate`) or land twice. Count and locate with the SAME
+# anchored regex, so what we count is exactly what we insert before.
+mapfile -t catchall_lines < <($RSUDO env cftr_re="$CFTR_CATCHALL_RE" awk '$0 ~ ENVIRON["cftr_re"] { print NR }' "$config")
+if [ "${#catchall_lines[@]}" != "1" ]; then
+    echo "ERROR: expected exactly one 'service: http_status:404' catch-all in $config, found ${#catchall_lines[@]}." >&2
     echo "       Fix the config manually so the catch-all is the LAST ingress entry, then retry." >&2
     exit 1
 fi
+catchall_line="${catchall_lines[0]}"
 
 # Detect the indent that the catch-all line uses, so the new block matches
 # the existing style (e.g. 2-space indent under `ingress:`). Falls back to
 # empty (zero-indent) if the catch-all has no leading whitespace.
-catchall_indent="$($SUDO sed -n -E 's/^([[:space:]]*)(-[[:space:]]+)?service:[[:space:]]*http_status:404[[:space:]]*$/\1/p' "$config" | head -1)"
+catchall_indent="$($RSUDO sed -n -E "${catchall_line}{s/^([[:space:]]*).*/\\1/p;q;}" "$config")"
 
 # Build the new YAML block with matching indentation.
 # The list-item dash sits at $catchall_indent; subsequent keys are 2 spaces
@@ -257,44 +292,28 @@ else
 ${key_indent}service: ${service}"
 fi
 
-# Check if hostname (with same path) already exists.
-# Match by exact string comparison on the parsed YAML field, NEVER by
-# interpolating $hostname into the awk regex source.
+# Walk the existing route blocks (see cftr_route_blocks in lib.sh).
+# Compare hostname/path as exact strings in bash - never as regex source.
+#   - already_present: same hostname + same path (or both path-less)
+#   - insert_line: normally the catch-all. A --path rule must go ABOVE an
+#     existing host-only rule for the same hostname: cloudflared matches
+#     top-down, so the host-only rule would otherwise shadow the new path
+#     forever. We insert above that rule's own leading comment lines, so
+#     its "# Added by ..." note stays attached to it.
 already_present="false"
-if [ -n "$path" ]; then
-    if $SUDO awk -v h="$hostname" -v p="$path" '
-        /^[[:space:]]*-[[:space:]]*hostname:/ {
-            cur = $NF; gsub(/["'"'"']/, "", cur)
-            in_block = (cur == h)
-            next
-        }
-        in_block && /^[[:space:]]+path:/ {
-            cp = $NF; gsub(/["'"'"']/, "", cp)
-            if (cp == p) { found = 1; exit }
-            in_block = 0
-        }
-        END { exit found ? 0 : 1 }
-    ' "$config"; then
+insert_line="$catchall_line"
+shadow_note=""
+while IFS=$'\t' read -r b_start _ b_cstart b_host b_path; do
+    [ "$b_host" = "$hostname" ] || continue
+    host_known="true"
+    if [ "$b_path" = "$path" ]; then
         already_present="true"
     fi
-else
-    if $SUDO awk -v h="$hostname" '
-        /^[[:space:]]*-[[:space:]]*hostname:/ {
-            if (in_block && !saw_path) { found = 1; exit }
-            cur = $NF; gsub(/["'"'"']/, "", cur)
-            in_block = (cur == h)
-            saw_path = 0
-            next
-        }
-        in_block && /^[[:space:]]+path:/ { saw_path = 1 }
-        END {
-            if (in_block && !saw_path) found = 1
-            exit found ? 0 : 1
-        }
-    ' "$config"; then
-        already_present="true"
+    if [ -n "$path" ] && [ -z "$b_path" ] && [ -z "$shadow_note" ] && [ "$b_cstart" -lt "$insert_line" ]; then
+        insert_line="$b_cstart"
+        shadow_note="above the existing host-only rule for $hostname (line $b_start)"
     fi
-fi
+done < <(cftr_route_blocks "$config")
 
 if [ "$already_present" = "true" ]; then
     echo "==> Ingress entry for $hostname${path:+ + path $path} already exists - skipping config edit."
@@ -303,20 +322,22 @@ if [ "$already_present" = "true" ]; then
         exit 0
     fi
 else
-    echo "==> Inserting ingress block before catch-all..."
-    # Insert the new block immediately before the line containing "service: http_status:404"
+    echo "==> Inserting ingress block ${shadow_note:-before catch-all}..."
+    # Build the candidate config in a private temp file. The block goes
+    # in via ENVIRON, NEVER `awk -v`: -v processes backslash escapes (\n,
+    # \040, and `\.` -> `.` in gawk/busybox), which would let a --path /
+    # --comment smuggle in extra YAML lines.
     tmp="$(mktemp)"
-    $SUDO awk -v block="$new_block" '
-        /service:[[:space:]]*http_status:404/ {
-            n = split(block, lines, "\n")
-            for (i=1; i<=n; i++) print lines[i]
+    $RSUDO env cftr_block="$new_block" cftr_at="$insert_line" awk '
+        NR == ENVIRON["cftr_at"] + 0 {
+            n = split(ENVIRON["cftr_block"], lines, "\n")
+            for (i = 1; i <= n; i++) print lines[i]
         }
         { print }
     ' "$config" > "$tmp"
 
     if [ ! -s "$tmp" ]; then
         echo "ERROR: Generated config is empty - aborting" >&2
-        rm -f "$tmp"
         exit 1
     fi
 
@@ -327,72 +348,101 @@ else
             echo "==> [dry-run] would write the following to $config:"
         fi
         show_preview "$config" "$tmp"
-        rm -f "$tmp"
         echo
-        echo "==> [dry-run] would: validate config + restart cloudflared ($service_mode)"
+        echo "==> [dry-run] would: validate, create DNS ($binary tunnel route dns $tunnel_id $hostname),"
+        echo "                     backup $config, replace it, restart cloudflared ($service_mode${service_unit:+: $service_unit})"
         echo "==> [dry-run] no changes made."
         exit 0
     fi
 
-    $SUDO cp "$tmp" "$config"
-    rm -f "$tmp"
+    # Stage the candidate NEXT TO the config with the original owner, group
+    # and mode, then validate THAT file. Permission problems and invalid
+    # ingress both surface here - before any DNS record exists.
+    cfg_meta="$(cftr_file_meta "$config")" || {
+        echo "ERROR: cannot stat $config" >&2
+        exit 1
+    }
+    read -r cfg_uid cfg_gid cfg_mode <<<"$cfg_meta"
+    staged="$(cftr_stage "$tmp" "$cfg_uid" "$cfg_gid" "$cfg_mode")" || {
+        staged=""
+        echo "ERROR: could not stage the new config next to $config - nothing changed." >&2
+        exit 1
+    }
+    echo
+    echo "==> Validating new config..."
+    if ! $SUDO "$binary" --config "$staged" tunnel ingress validate 2>&1; then
+        echo "ERROR: Config validation failed - nothing changed (no DNS record, config untouched)." >&2
+        exit 1
+    fi
 fi
 
-# Step 3: Validate the new config
+# The config must not have changed under us since the first read.
+cftr_assert_config_unchanged || exit 1
+
+# Create the DNS CNAME. Any non-zero exit is a failure - including the
+# "An A, AAAA, or CNAME record with that host already exists" CONFLICT,
+# where the name points somewhere else. (A record already routed to THIS
+# tunnel makes cloudflared exit 0, so re-runs stay idempotent.)
 echo
-echo "==> Validating config..."
-if ! $SUDO "$binary" --config "$config" tunnel ingress validate 2>&1; then
-    echo "ERROR: Config validation failed - restoring backup" >&2
-    $SUDO cp "$backup" "$config"
+echo "==> Creating DNS CNAME for $hostname..."
+dns_log="$(mktemp)"
+dns_rc=0
+"$binary" tunnel route dns "$tunnel_id" "$hostname" >"$dns_log" 2>&1 || dns_rc=$?
+cat "$dns_log"
+if [ "$dns_rc" -ne 0 ]; then
+    echo "ERROR: Failed to create DNS record (cloudflared exit $dns_rc) - config untouched." >&2
+    dns_out="$(cat "$dns_log")"
+    if [[ "${dns_out,,}" == *"already exists"* ]]; then
+        echo "       $hostname already has an A/AAAA/CNAME record that points elsewhere." >&2
+        echo "       If (and only if) you want to repoint it to this tunnel, run yourself:" >&2
+        echo "         $binary tunnel route dns --overwrite-dns $tunnel_id $hostname" >&2
+        echo "       then re-run this command. This script never overwrites DNS on its own." >&2
+    fi
+    exit 1
+fi
+dns_done="true"
+
+if [ "$already_present" = "true" ]; then
+    echo
+    echo "==> Config unchanged - no restart needed."
+    echo "==> Done. Test with: curl -I https://${hostname}${path:-/}"
+    exit 0
+fi
+
+# Backup, then swap in the staged file with an atomic same-directory rename.
+echo
+backup="$(cftr_backup)" || {
+    echo "ERROR: could not back up $config - config untouched." >&2
+    exit 1
+}
+echo "==> Backed up config to $backup"
+cftr_rotate_backups
+cftr_assert_config_unchanged || exit 1
+$SUDO mv -f -- "$staged" "$config_file"
+staged=""
+echo "==> Config updated."
+
+# Restart the unit that serves THIS config. On failure, put the backup
+# back (same owner/mode, atomic again) and restart once more.
+echo
+reload_rc=0
+cftr_reload || reload_rc=$?
+if [ "$reload_rc" -eq 1 ]; then
+    echo "ERROR: restoring previous config from $backup" >&2
+    if staged="$(cftr_stage "$backup" "$cfg_uid" "$cfg_gid" "$cfg_mode")"; then
+        $SUDO mv -f -- "$staged" "$config_file"
+        staged=""
+        cftr_reload || echo "ERROR: restart after restore failed too - check the service manually." >&2
+    else
+        staged=""
+        echo "ERROR: could not restore automatically; copy $backup over $config by hand." >&2
+    fi
     exit 1
 fi
 
-# Step 4: Reload/restart cloudflared
 echo
-echo "==> Restarting cloudflared ($service_mode)..."
-case "$service_mode" in
-    systemd)
-        $SUDO systemctl restart cloudflared
-        sleep 2
-        $SUDO systemctl is-active --quiet cloudflared && echo "    Active." || {
-            echo "ERROR: cloudflared failed to start" >&2
-            $SUDO systemctl status cloudflared --no-pager -n 20
-            exit 1
-        }
-        ;;
-    manual)
-        echo "    Sending SIGHUP to running cloudflared (manual mode)..."
-        # Find the PID of the cloudflared process running THIS tunnel/config.
-        # 1. pgrep candidates by command-line keyword
-        # 2. require comm == cloudflared (skip editors/grep/helpers that
-        #    happen to contain the same string)
-        # 3. require the argv to mention either our tunnel_id or our
-        #    config path (so we don't HUP an unrelated cloudflared running
-        #    a different tunnel on the same host).
-        cf_pids=()
-        while read -r pid; do
-            [ -z "$pid" ] && continue
-            comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
-            [ "$comm" = "cloudflared" ] || continue
-            args="$($SUDO ps -o args= -p "$pid" 2>/dev/null || true)"
-            case "$args" in
-                *"$tunnel_id"*|*"$config"*) cf_pids+=("$pid") ;;
-            esac
-        done < <($SUDO pgrep -f 'cloudflared.*tunnel.*run' 2>/dev/null || true)
-        if [ "${#cf_pids[@]}" -eq 0 ]; then
-            echo "WARN: no cloudflared process found for tunnel $tunnel_id - restart manually." >&2
-        else
-            $SUDO kill -HUP "${cf_pids[@]}" || {
-                echo "WARN: SIGHUP failed - restart manually." >&2
-            }
-        fi
-        ;;
-    none)
-        echo "WARN: cloudflared is not currently running." >&2
-        echo "      Start it with: cloudflared tunnel run $tunnel_id" >&2
-        echo "      Or as a service: sudo cloudflared service install" >&2
-        ;;
-esac
-
-echo
+if [ "$reload_rc" -eq 3 ]; then
+    echo "==> Config written, but NOT live until cloudflared restarts (exit 3)." >&2
+    exit 3
+fi
 echo "==> Done. Test with: curl -I https://${hostname}${path:-/}"

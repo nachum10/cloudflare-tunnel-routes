@@ -44,7 +44,7 @@ bash scripts/add-route.sh example.com 3000 --path "/api/v1.*" --comment "v1 API"
 bash scripts/add-route.sh example.com 3001 --path "/api/v2.*" --comment "v2 API"
 ```
 
-`cloudflared` matches first-hit, top-down — `add-route.sh` always inserts above the catch-all `404`, so order is preserved.
+`cloudflared` matches first-hit, top-down. `add-route.sh` inserts new rules above the catch-all `404`, so the order you add them in is kept. One exception keeps path rules reachable: if `example.com` already has a host-only rule (no `path:`), a new `--path` rule for `example.com` is inserted directly *above* that host-only rule, because the host-only rule would otherwise match every request first.
 
 ## Production hardening
 

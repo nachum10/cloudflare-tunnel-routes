@@ -6,11 +6,24 @@ on:
   pull_request:
     branches: [main]
 
+# The suite only reads the repo; nothing here needs write access.
+permissions:
+  contents: read
+
+env:
+  # Pinned yq for the list-routes yq code path. Bump both values together;
+  # the SHA-256 comes from the release's `checksums` asset (column 19,
+  # per `checksums_hashes_order`).
+  YQ_VERSION: v4.54.1
+  YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: shell syntax check
         run: |
@@ -19,11 +32,17 @@ jobs:
           done
           echo "syntax: OK"
 
-      - name: install yq (exercises yq codepath in list-routes.sh)
+      - name: shellcheck (severity warning)
         run: |
-          sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
-              -o /usr/local/bin/yq
-          sudo chmod +x /usr/local/bin/yq
+          shellcheck --version
+          shellcheck -x -S warning scripts/*.sh tests/*.sh install.sh
+
+      - name: install pinned yq (exercises the yq path in list-routes.sh)
+        run: |
+          curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+              -o "$RUNNER_TEMP/yq"
+          echo "${YQ_SHA256}  $RUNNER_TEMP/yq" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/yq" /usr/local/bin/yq
           yq --version
 
       - name: run test suite
