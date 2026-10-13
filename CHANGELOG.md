@@ -2,7 +2,7 @@
 
 All notable changes to this project. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/) as described in [`RELEASE.md`](./RELEASE.md).
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-10-13
 
 A security-hardening release. If you drive the scripts from automation or an AI agent, read **Behaviour changes** first.
 
