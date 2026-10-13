@@ -29,15 +29,15 @@ show_preview() {
     local orig="$1" new="$2"
     if [ "$show_diff" = "true" ]; then
         if command -v delta >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
         elif command -v colordiff >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
         else
-            $SUDO diff -u "$orig" "$new" 2>/dev/null || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null || true
         fi
     else
         echo "----- 8< -----"
-        $SUDO cat "$new"
+        $RSUDO cat "$new"
         echo "----- >8 -----"
     fi
 }
@@ -201,6 +201,13 @@ SUDO=""
 if [ "$needs_sudo" = "true" ]; then
     SUDO="sudo"
 fi
+# Reads need root only when the config itself is unreadable. A typical
+# root-owned but world-readable /etc/cloudflared/config.yml can then be
+# previewed (--diff) without any sudo at all.
+RSUDO=""
+if [ -n "$SUDO" ] && [ ! -r "$config" ]; then
+    RSUDO="$SUDO"
+fi
 
 # All writes go to the real file behind $config (it may be a symlink).
 config_file="$(cftr_real_path "$config")" || {
@@ -243,6 +250,7 @@ trap on_exit EXIT
 # the restart, so two concurrent runs can never interleave their edits.
 # Running "$binary" as root (validate) needs a trustworthy binary.
 if [ "$dry_run" != "true" ]; then
+    cftr_check_sudo || exit 1
     cftr_check_binary || exit 1
     cftr_lock_acquire || exit 1
 fi
@@ -251,7 +259,7 @@ fi
 # or several, the edit would silently no-op (an unchanged file still passes
 # `tunnel ingress validate`) or land twice. Count and locate with the SAME
 # anchored regex, so what we count is exactly what we insert before.
-mapfile -t catchall_lines < <($SUDO env cftr_re="$CFTR_CATCHALL_RE" awk '$0 ~ ENVIRON["cftr_re"] { print NR }' "$config")
+mapfile -t catchall_lines < <($RSUDO env cftr_re="$CFTR_CATCHALL_RE" awk '$0 ~ ENVIRON["cftr_re"] { print NR }' "$config")
 if [ "${#catchall_lines[@]}" != "1" ]; then
     echo "ERROR: expected exactly one 'service: http_status:404' catch-all in $config, found ${#catchall_lines[@]}." >&2
     echo "       Fix the config manually so the catch-all is the LAST ingress entry, then retry." >&2
@@ -262,7 +270,7 @@ catchall_line="${catchall_lines[0]}"
 # Detect the indent that the catch-all line uses, so the new block matches
 # the existing style (e.g. 2-space indent under `ingress:`). Falls back to
 # empty (zero-indent) if the catch-all has no leading whitespace.
-catchall_indent="$($SUDO sed -n -E "${catchall_line}{s/^([[:space:]]*).*/\\1/p;q;}" "$config")"
+catchall_indent="$($RSUDO sed -n -E "${catchall_line}{s/^([[:space:]]*).*/\\1/p;q;}" "$config")"
 
 # Build the new YAML block with matching indentation.
 # The list-item dash sits at $catchall_indent; subsequent keys are 2 spaces
@@ -319,7 +327,7 @@ else
     # \040, and `\.` -> `.` in gawk/busybox), which would let a --path /
     # --comment smuggle in extra YAML lines.
     tmp="$(mktemp)"
-    $SUDO env cftr_block="$new_block" cftr_at="$insert_line" awk '
+    $RSUDO env cftr_block="$new_block" cftr_at="$insert_line" awk '
         NR == ENVIRON["cftr_at"] + 0 {
             n = split(ENVIRON["cftr_block"], lines, "\n")
             for (i = 1; i <= n; i++) print lines[i]

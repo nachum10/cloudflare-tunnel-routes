@@ -929,6 +929,49 @@ assert_eq "needs_sudo path keeps mode 0444" "444" \
     "$(stat -c '%a' "$work_dir/config.yml" 2>/dev/null || stat -f '%Lp' "$work_dir/config.yml")"
 assert_contains "needs_sudo path writes the new block" "hostname: app.example.com" "$(cat "$work_dir/config.yml")"
 
+# Root-owned-but-readable config (the usual /etc/cloudflared shape) and a
+# sudo that needs a password, with no terminal: previews must work with no
+# sudo at all; real runs must stop up front with "needs root", unchanged.
+setup; apply_fixture
+chmod 0444 "$work_dir/config.yml"
+rc=0
+out="$(STUB_SUDO_NOPASS=1 run_add app.example.com 8080 --diff)" || rc=$?
+assert_eq "readable config, no sudo: add --diff exits 0" "0" "$rc"
+assert_contains "readable config, no sudo: add --diff shows the block" "+  - hostname: app.example.com" "$out"
+rc=0
+out="$(STUB_SUDO_NOPASS=1 run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "no usable sudo: add apply fails" "$rc"
+assert_contains "no usable sudo: add says needs root" "needs root" "$out"
+assert_eq "no usable sudo: add leaves config unchanged" "same" "$(config_unchanged)"
+assert_not_contains "no usable sudo: add makes no DNS call" "route dns" "$(cat "$stub_log")"
+rc=0
+out="$(STUB_SUDO_NOPASS=1 run_remove keep.example.com --diff)" || rc=$?
+assert_eq "readable config, no sudo: remove --diff exits 0" "0" "$rc"
+assert_contains "readable config, no sudo: remove --diff shows the removal" "-  - hostname: keep.example.com" "$out"
+rc=0
+out="$(STUB_SUDO_NOPASS=1 run_remove keep.example.com --keep-dns)" || rc=$?
+assert_exit_nonzero "no usable sudo: remove apply fails" "$rc"
+assert_contains "no usable sudo: remove says needs root" "needs root" "$out"
+assert_eq "no usable sudo: remove leaves config unchanged" "same" "$(config_unchanged)"
+
+# A config path with a space reaches every consumer: apply both ways.
+setup
+mkdir -p "$work_dir/my conf"
+printf 'tunnel: 11111111-2222-3333-4444-555555555555\ncredentials-file: /tmp/x.json\ningress:\n  - service: http_status:404\n' \
+    > "$work_dir/my conf/config.yml"
+add_unit cloudflared-alpha.service \
+    "/usr/bin/cloudflared --config $work_dir/my conf/config.yml tunnel run"
+rc=0
+out="$(PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/my conf/config.yml" CFTR_BINARY="$fake_bin" \
+    bash "$SCRIPTS/add-route.sh" app.example.com 8080 2>&1 </dev/null)" || rc=$?
+assert_eq "config path with a space: add applies" "0" "$rc"
+assert_contains "config path with a space: block written" "hostname: app.example.com" "$(cat "$work_dir/my conf/config.yml")"
+rc=0
+out="$(PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/my conf/config.yml" CFTR_BINARY="$fake_bin" \
+    bash "$SCRIPTS/remove-route.sh" app.example.com --keep-dns 2>&1 </dev/null)" || rc=$?
+assert_eq "config path with a space: remove applies" "0" "$rc"
+assert_not_contains "config path with a space: block removed" "app.example.com" "$(cat "$work_dir/my conf/config.yml")"
+
 # Symlinked config: write through to the target, keep the link and the
 # target's mode (a mv onto the link would make it a 0777-stat'd file).
 setup; apply_fixture

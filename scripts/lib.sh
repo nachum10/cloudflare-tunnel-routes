@@ -23,7 +23,7 @@ CFTR_CATCHALL_RE='^[[:space:]]*(-[[:space:]]+)?service:[[:space:]]*http_status:4
 # block's own top-level `path:` key counts. Values are $NF with quotes
 # stripped, so they never contain tabs.
 cftr_route_blocks() {
-    $SUDO awk '
+    $RSUDO awk '
         function indent_of(s) { match(s, /^[ \t]*/); return RLENGTH }
         function strip(v) { gsub(/["'"'"']/, "", v); return v }
         function close_block() {
@@ -67,10 +67,10 @@ cftr_route_blocks() {
 # onto the symlink itself would replace the link with a regular file.
 cftr_real_path() {
     local p="$1" link hops=0
-    while $SUDO test -L "$p"; do
+    while $RSUDO test -L "$p"; do
         hops=$((hops + 1))
         [ "$hops" -le 40 ] || return 1
-        link="$($SUDO readlink "$p")" || return 1
+        link="$($RSUDO readlink "$p")" || return 1
         case "$link" in
             /*) p="$link" ;;
             *)  p="$(dirname "$p")/$link" ;;
@@ -83,6 +83,23 @@ cftr_real_path() {
 # the 0777 of a symlink), GNU stat first, then BSD/macOS stat.
 cftr_file_meta() {
     $SUDO stat -L -c '%u %g %a' "$1" 2>/dev/null || $SUDO stat -L -f '%u %g %Lp' "$1"
+}
+
+# cftr_check_sudo
+# A real run that needs root must find out up front, before any change,
+# instead of failing half-way with a confusing error. `sudo -n` never
+# blocks on a hidden prompt; only on a terminal may sudo ask.
+cftr_check_sudo() {
+    [ -n "$SUDO" ] || return 0
+    if $SUDO -n true 2>/dev/null; then
+        return 0
+    fi
+    if [ -t 0 ] && $SUDO -v; then
+        return 0
+    fi
+    echo "ERROR: changing $config needs root, and sudo needs a password." >&2
+    echo "       needs root: re-run in a terminal (so sudo can ask) or with sudo. Nothing was changed." >&2
+    return 1
 }
 
 # cftr_check_binary

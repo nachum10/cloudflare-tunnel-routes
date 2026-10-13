@@ -18,15 +18,15 @@ show_preview() {
     local orig="$1" new="$2"
     if [ "$show_diff" = "true" ]; then
         if command -v delta >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | delta || true
         elif command -v colordiff >/dev/null 2>&1; then
-            $SUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null | colordiff || true
         else
-            $SUDO diff -u "$orig" "$new" 2>/dev/null || true
+            $RSUDO diff -u "$orig" "$new" 2>/dev/null || true
         fi
     else
         echo "----- 8< -----"
-        $SUDO cat "$new"
+        $RSUDO cat "$new"
         echo "----- >8 -----"
     fi
 }
@@ -109,6 +109,11 @@ SUDO=""
 if [ "$needs_sudo" = "true" ]; then
     SUDO="sudo"
 fi
+# Reads need root only when the config itself is unreadable (see add-route).
+RSUDO=""
+if [ -n "$SUDO" ] && [ ! -r "$config" ]; then
+    RSUDO="$SUDO"
+fi
 
 # All writes go to the real file behind $config (it may be a symlink).
 config_file="$(cftr_real_path "$config")" || {
@@ -129,6 +134,7 @@ trap on_exit EXIT
 # Real runs: trustworthy binary for the root-run validate, and an
 # exclusive lock from the first read of the config to the restart.
 if [ "$dry_run" != "true" ]; then
+    cftr_check_sudo || exit 1
     cftr_check_binary || exit 1
     cftr_lock_acquire || exit 1
 fi
@@ -156,7 +162,7 @@ done < <(cftr_route_blocks "$config")
 tmp="$(mktemp)"
 # Drop the chosen line ranges; after each, also swallow one trailing
 # blank line so the config stays tidy.
-$SUDO env cftr_ranges="$ranges" awk '
+$RSUDO env cftr_ranges="$ranges" awk '
     BEGIN {
         n = split(ENVIRON["cftr_ranges"], r, " ")
         for (i = 1; i <= n; i++) {
