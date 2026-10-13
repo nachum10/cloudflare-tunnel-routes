@@ -886,6 +886,21 @@ assert_eq "needs_sudo path keeps mode 0444" "444" \
     "$(stat -c '%a' "$work_dir/config.yml" 2>/dev/null || stat -f '%Lp' "$work_dir/config.yml")"
 assert_contains "needs_sudo path writes the new block" "hostname: app.example.com" "$(cat "$work_dir/config.yml")"
 
+# Symlinked config: write through to the target, keep the link and the
+# target's mode (a mv onto the link would make it a 0777-stat'd file).
+setup; apply_fixture
+mv "$work_dir/config.yml" "$work_dir/real.yml"
+chmod 0640 "$work_dir/real.yml"
+ln -s real.yml "$work_dir/config.yml"
+rc=0
+out="$(run_add app.example.com 8080)" || rc=$?
+assert_eq "symlinked config exits 0" "0" "$rc"
+assert_eq "symlinked config stays a symlink" "link" \
+    "$([ -L "$work_dir/config.yml" ] && echo link || echo file)"
+assert_contains "symlink target gets the new block" "hostname: app.example.com" "$(cat "$work_dir/real.yml")"
+assert_eq "config behind the symlink keeps mode 0640 (never 0777)" "640" \
+    "$(stat -L -c '%a' "$work_dir/config.yml" 2>/dev/null || stat -L -f '%Lp' "$work_dir/config.yml")"
+
 # Existing route, real run: DNS is ensured, but no backup and no restart
 setup; apply_fixture
 rc=0
@@ -1041,6 +1056,26 @@ rc=0
 out="$(STUB_VALIDATE_FAIL=1 run_remove after.example.com --keep-dns)" || rc=$?
 assert_exit_nonzero "remove validate failure -> non-zero exit" "$rc"
 assert_eq "remove validate failure -> config untouched" "same" "$(config_unchanged)"
+
+# remove-route: restart failure restores the config and restarts again
+: > "$stub_log"
+rc=0
+out="$(STUB_RESTART_FAIL=1 run_remove after.example.com --keep-dns)" || rc=$?
+assert_exit_nonzero "remove restart failure -> non-zero exit" "$rc"
+assert_eq "remove restart failure -> config restored" "same" "$(config_unchanged)"
+assert_eq "remove restart failure -> restarted again after restore" "2" \
+    "$(grep -c '^systemctl restart ' "$stub_log")"
+
+# remove-route: two units on the config -> nothing restarted, exit 3
+add_unit cloudflared-beta.service \
+    "/usr/bin/cloudflared --config $work_dir/config.yml tunnel run"
+: > "$stub_log"
+rc=0
+out="$(run_remove after.example.com --keep-dns)" || rc=$?
+assert_eq "remove with ambiguous units -> exit 3" "3" "$rc"
+assert_not_contains "remove with ambiguous units -> nothing restarted" "systemctl restart" "$(cat "$stub_log")"
+assert_not_contains "remove with ambiguous units -> route still removed" \
+    "after.example.com" "$(cat "$work_dir/config.yml")"
 
 echo
 echo "=== service targeting: the right unit, or none ==="

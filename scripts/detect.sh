@@ -60,7 +60,18 @@ fi
 # atomically (temp file + mv in the same directory) and keep its owner,
 # so we also need a writable directory and, unless root, to own the file.
 if [ -n "$found_config" ]; then
-    if [ ! -w "$found_config" ] || [ ! -w "$(dirname "$found_config")" ]; then
+    # For a symlinked config the edit lands next to the link's TARGET.
+    real_config="$found_config"
+    hops=0
+    while [ -L "$real_config" ] && [ "$hops" -lt 40 ]; do
+        hops=$((hops + 1))
+        link="$(readlink "$real_config" 2>/dev/null)" || break
+        case "$link" in
+            /*) real_config="$link" ;;
+            *)  real_config="$(dirname "$real_config")/$link" ;;
+        esac
+    done
+    if [ ! -w "$found_config" ] || [ ! -w "$(dirname "$real_config")" ]; then
         needs_sudo="true"
     elif [ "$(id -u)" != "0" ] && [ ! -O "$found_config" ]; then
         needs_sudo="true"

@@ -107,6 +107,12 @@ if [ "$needs_sudo" = "true" ]; then
     SUDO="sudo"
 fi
 
+# All writes go to the real file behind $config (it may be a symlink).
+config_file="$(cftr_real_path "$config")" || {
+    echo "ERROR: cannot resolve symlinks for $config" >&2
+    exit 1
+}
+
 tmp=""; staged=""
 on_exit() {
     local rc=$?
@@ -199,7 +205,7 @@ backup="$(cftr_backup)" || {
 }
 echo "==> Backed up config to $backup"
 cftr_rotate_backups
-$SUDO mv -f -- "$staged" "$config"
+$SUDO mv -f -- "$staged" "$config_file"
 staged=""
 echo "    Removed."
 
@@ -209,7 +215,7 @@ cftr_reload || reload_rc=$?
 if [ "$reload_rc" -eq 1 ]; then
     echo "ERROR: restoring previous config from $backup" >&2
     if staged="$(cftr_stage "$backup" "$cfg_uid" "$cfg_gid" "$cfg_mode")"; then
-        $SUDO mv -f -- "$staged" "$config"
+        $SUDO mv -f -- "$staged" "$config_file"
         staged=""
         cftr_reload || echo "ERROR: restart after restore failed too - check the service manually." >&2
     else

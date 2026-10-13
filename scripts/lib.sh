@@ -2,7 +2,8 @@
 # shellcheck disable=SC2034,SC2154  # globals are set / used by the callers
 # Shared helpers for add-route.sh / remove-route.sh. Sourced, not executed.
 #
-# Callers must set: SUDO ("" or "sudo"), config, service_mode, service_unit,
+# Callers must set: SUDO ("" or "sudo"), config, config_file (the real file
+# behind $config, see cftr_real_path), service_mode, service_unit,
 # service_candidates, tunnel_id.
 
 # The ONE catch-all pattern (POSIX ERE). Used for counting AND for picking
@@ -60,18 +61,37 @@ cftr_route_blocks() {
     ' "$1"
 }
 
-# cftr_file_meta <file>  ->  "uid gid mode" (GNU stat, then BSD/macOS stat).
+# cftr_real_path <path>  ->  the file a (chain of) symlink(s) points to.
+# Plain `readlink` per hop (no GNU -f) so it works on macOS too. Every
+# write - staging, backups, the final mv - targets this real file: a mv
+# onto the symlink itself would replace the link with a regular file.
+cftr_real_path() {
+    local p="$1" link hops=0
+    while $SUDO test -L "$p"; do
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || return 1
+        link="$($SUDO readlink "$p")" || return 1
+        case "$link" in
+            /*) p="$link" ;;
+            *)  p="$(dirname "$p")/$link" ;;
+        esac
+    done
+    printf '%s\n' "$p"
+}
+
+# cftr_file_meta <file>  ->  "uid gid mode" of the file itself (-L: never
+# the 0777 of a symlink), GNU stat first, then BSD/macOS stat.
 cftr_file_meta() {
-    $SUDO stat -c '%u %g %a' "$1" 2>/dev/null || $SUDO stat -f '%u %g %Lp' "$1"
+    $SUDO stat -L -c '%u %g %a' "$1" 2>/dev/null || $SUDO stat -L -f '%u %g %Lp' "$1"
 }
 
 # cftr_stage <src> <uid> <gid> <mode>
 # Copy <src> into a fresh temp file NEXT TO $config (same filesystem, so
 # the final mv is an atomic rename) with the given owner/group/mode, and
-# print its path. The name must never match "${config}.bak.*".
+# print its path. The name must never match "${config_file}.bak.*".
 cftr_stage() {
     local src="$1" uid="$2" gid="$3" mode="$4" staged cur
-    staged="$($SUDO mktemp "${config}.cftr-tmp.XXXXXX")" || return 1
+    staged="$($SUDO mktemp "${config_file}.cftr-tmp.XXXXXX")" || return 1
     if ! { $SUDO cp "$src" "$staged" && $SUDO chmod "$mode" "$staged"; }; then
         $SUDO rm -f -- "$staged"; return 1
     fi
@@ -87,7 +107,7 @@ cftr_stage() {
 # suffix), so two runs in the same second never overwrite each other.
 cftr_backup() {
     local b
-    b="$($SUDO mktemp "${config}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
+    b="$($SUDO mktemp "${config_file}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
     $SUDO cp "$config" "$b" || { $SUDO rm -f -- "$b"; return 1; }
     printf '%s\n' "$b"
 }
@@ -97,7 +117,7 @@ cftr_backup() {
 cftr_rotate_backups() {
     # shellcheck disable=SC2012
     local stale
-    mapfile -t stale < <($SUDO ls -1t "${config}".bak.* 2>/dev/null | tail -n +6) || true
+    mapfile -t stale < <($SUDO ls -1t "${config_file}".bak.* 2>/dev/null | tail -n +6) || true
     if [ "${#stale[@]}" -gt 0 ]; then
         $SUDO rm -f -- "${stale[@]}"
     fi

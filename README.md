@@ -381,7 +381,7 @@ The scripts restart only the systemd unit whose `ExecStart` contains `--config <
 
 ## Tests
 
-A hermetic test suite lives in `tests/run-tests.sh` (149 tests; every external command - cloudflared, systemctl, sudo - is a logging stub, so no real DNS or service calls):
+A hermetic test suite lives in `tests/run-tests.sh` (159 tests; every external command - cloudflared, systemctl, sudo - is a logging stub, so no real DNS or service calls):
 
 ```bash
 bash tests/run-tests.sh
