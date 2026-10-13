@@ -32,7 +32,7 @@ docs-check:
 	         examples/gradio.md examples/streamlit.md examples/fastapi.md \
 	         examples/webhooks.md examples/docker.md \
 	         scripts/detect.sh scripts/add-route.sh scripts/remove-route.sh \
-	         scripts/list-routes.sh scripts/setup-new-tunnel.sh \
+	         scripts/list-routes.sh scripts/setup-new-tunnel.sh scripts/lib.sh \
 	         tests/run-tests.sh references/troubleshooting.md; do \
 	    if [ ! -e "$$f" ]; then echo "MISSING: $$f"; missing=$$((missing+1)); fi; \
 	done; \

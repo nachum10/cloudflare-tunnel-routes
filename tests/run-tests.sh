@@ -22,22 +22,138 @@ FAIL=0
 # --- helpers ---------------------------------------------------------------
 
 work_dir=""
+work_dirs=()
 fake_bin=""
+stub_dir=""
+stub_log=""
 cleanup() {
-    [ -n "$work_dir" ] && rm -rf "$work_dir"
+    local d
+    for d in "${work_dirs[@]}"; do
+        rm -rf "$d"
+    done
 }
 trap cleanup EXIT
 
-setup() {
-    work_dir="$(mktemp -d)"
-    # Stub cloudflared: prints args, exits 0 - so DNS + validate are no-ops.
-    fake_bin="$work_dir/cloudflared"
-    cat > "$fake_bin" <<'STUB'
+# Every script run goes through run_* below, which put $stub_dir FIRST on
+# PATH. The stubs log each call to $stub_log and never touch the host:
+#   cloudflared  DNS + validate; fails on demand via env flags:
+#                STUB_DNS_FAIL=1, STUB_DNS_CONFLICT=1, STUB_VALIDATE_FAIL=1
+#   systemctl    fake units from $work_dir/units ("name<TAB>argv" lines);
+#                STUB_RESTART_FAIL=1 makes restart / is-active fail
+#   sudo         logs, then runs the command as the current user
+#   pgrep        prints nothing unless STUB_PGREP=1 (then a PID that can't
+#                exist); ps prints nothing; sleep is instant;
+#   delta / colordiff  plain cat, so --diff output is stable everywhere
+# Pass flags as a prefix on ONE command (STUB_X=1 run_add ...), never export.
+write_stubs() {
+    mkdir -p "$stub_dir"
+    cat > "$stub_dir/cloudflared" <<'STUB'
 #!/usr/bin/env bash
-echo "[stub-cloudflared] $*"
+echo "cloudflared $*" >> "$(dirname "$0")/../stub.log"
+case " $* " in
+    *" tunnel route dns "*)
+        if [ -n "${STUB_DNS_CONFLICT:-}" ]; then
+            echo "Failed to add route: code: 1003, reason: Failed to create record ${*: -1} with err An A, AAAA, or CNAME record with that host already exists." >&2
+            exit 1
+        fi
+        if [ -n "${STUB_DNS_FAIL:-}" ]; then
+            echo "Failed to add route: code: 1000, reason: stub failure" >&2
+            exit 1
+        fi
+        echo "INF Added CNAME ${*: -1} which will route to this tunnel"
+        ;;
+    *" tunnel ingress validate "*)
+        if [ -n "${STUB_VALIDATE_FAIL:-}" ]; then
+            echo "Validation failed: stub" >&2
+            exit 1
+        fi
+        echo "OK"
+        ;;
+    *) echo "[stub-cloudflared] $*" ;;
+esac
 exit 0
 STUB
-    chmod +x "$fake_bin"
+    cat > "$stub_dir/systemctl" <<'STUB'
+#!/usr/bin/env bash
+here="$(dirname "$0")/.."
+echo "systemctl $*" >> "$here/stub.log"
+units="$here/units"
+[ -f "$units" ] || : > "$units"
+unit="${*: -1}"
+case "$1" in
+    list-units|list-unit-files)
+        while IFS=$'\t' read -r n _; do
+            echo "$n loaded active running Cloudflare Tunnel"
+        done < "$units"
+        ;;
+    show)
+        if [ "$3" = "ExecStart" ]; then
+            while IFS=$'\t' read -r n a; do
+                [ "$n" = "$unit" ] && echo "{ path=/usr/bin/cloudflared ; argv[]=$a ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+            done < "$units"
+        else
+            echo "ActiveState=failed"
+        fi
+        ;;
+    restart|is-active)
+        [ -n "${STUB_RESTART_FAIL:-}" ] && exit 3
+        ;;
+esac
+exit 0
+STUB
+    cat > "$stub_dir/sudo" <<'STUB'
+#!/usr/bin/env bash
+echo "sudo $*" >> "$(dirname "$0")/../stub.log"
+exec "$@"
+STUB
+    cat > "$stub_dir/pgrep" <<'STUB'
+#!/usr/bin/env bash
+echo "pgrep $*" >> "$(dirname "$0")/../stub.log"
+if [ -n "${STUB_PGREP:-}" ]; then
+    echo 999999999
+    exit 0
+fi
+exit 1
+STUB
+    printf '#!/bin/sh\nexit 0\n' > "$stub_dir/ps"
+    printf '#!/bin/sh\nexit 0\n' > "$stub_dir/sleep"
+    printf '#!/bin/sh\nexec cat\n' > "$stub_dir/delta"
+    printf '#!/bin/sh\nexec cat\n' > "$stub_dir/colordiff"
+    chmod +x "$stub_dir"/*
+}
+
+setup() {
+    work_dir="$(mktemp -d)"
+    work_dirs+=("$work_dir")
+    stub_dir="$work_dir/bin"
+    stub_log="$work_dir/stub.log"
+    : > "$stub_log"
+    write_stubs
+    fake_bin="$stub_dir/cloudflared"
+}
+
+# add_unit <name> <argv>: a fake systemd unit for the systemctl stub.
+add_unit() {
+    printf '%s\t%s\n' "$1" "$2" >> "$work_dir/units"
+}
+
+# count_files <glob>: how many entries in $work_dir match the glob.
+count_files() {
+    local f n=0
+    for f in "$work_dir"/$1; do
+        [ -e "$f" ] && n=$((n + 1))
+    done
+    echo "$n"
+}
+
+# Verbs of interest from the stub log, in call order, on one line.
+stub_verbs() {
+    awk '
+        / tunnel ingress validate/ { printf "%svalidate", sep; sep = " " }
+        / tunnel route dns /       { printf "%sdns", sep; sep = " " }
+        /^systemctl restart /      { printf "%srestart:%s", sep, $NF; sep = " " }
+        END { print "" }
+    ' "$stub_log"
 }
 
 write_fixture() {
@@ -123,22 +239,22 @@ assert_exit_nonzero() {
 }
 
 run_add() {
-    CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
+    PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
         bash "$SCRIPTS/add-route.sh" "$@" 2>&1
 }
 
 run_remove() {
-    CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
+    PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
         bash "$SCRIPTS/remove-route.sh" "$@" 2>&1
 }
 
 run_list() {
-    CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
+    PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
         bash "$SCRIPTS/list-routes.sh" 2>&1
 }
 
 run_detect() {
-    CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
+    PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
         bash "$SCRIPTS/detect.sh" 2>&1
 }
 
@@ -675,6 +791,324 @@ else
     # awk step ran, not a silent no-op).
     assert_contains "tab config accepted, block inserted" "hostname: app.example.com" "$out"
 fi
+
+echo
+echo "=== apply path: order, failures, rollback (stubbed) ==="
+# Base fixture for apply-path tests. Real writes happen, but only to the
+# per-test work dir; every external command is a stub from $stub_dir.
+apply_fixture() {
+    write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - hostname: keep.example.com
+    service: http://127.0.0.1:9000
+  - service: http_status:404
+EOF
+    cp "$work_dir/config.yml" "$work_dir/orig.yml"
+    add_unit cloudflared-alpha.service \
+        "/usr/bin/cloudflared --no-autoupdate --config $work_dir/config.yml tunnel run"
+}
+config_unchanged() {
+    cmp -s "$work_dir/orig.yml" "$work_dir/config.yml" && echo same || echo changed
+}
+
+# Happy path: validate -> route dns -> restart of the matching unit
+setup; apply_fixture
+rc=0
+out="$(run_add app.example.com 8080)" || rc=$?
+assert_eq "happy path exits 0" "0" "$rc"
+assert_eq "happy path order: validate, dns, restart" \
+    "validate dns restart:cloudflared-alpha.service" "$(stub_verbs)"
+validated="$(grep ' tunnel ingress validate' "$stub_log" | head -n 1)"
+assert_not_contains "validate runs on the staged file, not the live config" \
+    "--config $work_dir/config.yml tunnel" "$validated"
+assert_contains "happy path writes the new block" "hostname: app.example.com" "$(cat "$work_dir/config.yml")"
+assert_eq "happy path leaves no staged temp files" "0" \
+    "$(count_files 'config.yml.cftr-tmp.*')"
+
+# DNS failure: non-zero, config untouched, nothing restarted
+setup; apply_fixture
+rc=0
+out="$(STUB_DNS_FAIL=1 run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "DNS failure -> non-zero exit" "$rc"
+assert_eq "DNS failure -> config untouched" "same" "$(config_unchanged)"
+assert_not_contains "DNS failure -> no restart" "systemctl restart" "$(cat "$stub_log")"
+
+# DNS CONFLICT ("record with that host already exists") is a failure too
+setup; apply_fixture
+rc=0
+out="$(STUB_DNS_CONFLICT=1 run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "DNS conflict -> non-zero exit" "$rc"
+assert_eq "DNS conflict -> config untouched" "same" "$(config_unchanged)"
+assert_contains "DNS conflict -> --overwrite-dns hint" "--overwrite-dns" "$out"
+assert_not_contains "DNS conflict -> --overwrite-dns never run" "overwrite-dns" "$(cat "$stub_log")"
+
+# Validation failure: no DNS call at all, config untouched
+setup; apply_fixture
+rc=0
+out="$(STUB_VALIDATE_FAIL=1 run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "validate failure -> non-zero exit" "$rc"
+assert_not_contains "validate failure -> no DNS call" "route dns" "$(cat "$stub_log")"
+assert_eq "validate failure -> config untouched" "same" "$(config_unchanged)"
+assert_eq "validate failure -> no staged temp files" "0" \
+    "$(count_files 'config.yml.cftr-tmp.*')"
+
+# Restart failure: config restored, restarted again, non-zero, DNS hint
+setup; apply_fixture
+rc=0
+out="$(STUB_RESTART_FAIL=1 run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "restart failure -> non-zero exit" "$rc"
+assert_eq "restart failure -> config restored" "same" "$(config_unchanged)"
+assert_eq "restart failure -> restarted again after restore" "2" \
+    "$(grep -c '^systemctl restart ' "$stub_log")"
+assert_contains "restart failure -> orphan CNAME dashboard hint" "Cloudflare dashboard" "$out"
+assert_not_contains "restart failure -> no unit command line leaked" "argv[]" "$out"
+
+# Owner and mode of the config survive the atomic replace
+setup; apply_fixture
+chmod 0640 "$work_dir/config.yml"
+rc=0
+out="$(run_add app.example.com 8080)" || rc=$?
+assert_eq "atomic replace keeps mode 0640" "640" \
+    "$(stat -c '%a' "$work_dir/config.yml" 2>/dev/null || stat -f '%Lp' "$work_dir/config.yml")"
+assert_eq "atomic replace keeps owner" "$(id -u)" \
+    "$(stat -c '%u' "$work_dir/config.yml" 2>/dev/null || stat -f '%u' "$work_dir/config.yml")"
+
+# Read-only config -> needs_sudo path (the sudo stub runs as us)
+setup; apply_fixture
+chmod 0444 "$work_dir/config.yml"
+rc=0
+out="$(run_add app.example.com 8080)" || rc=$?
+assert_eq "needs_sudo path exits 0" "0" "$rc"
+assert_contains "needs_sudo path goes through sudo" "sudo mv -f" "$(cat "$stub_log")"
+assert_eq "needs_sudo path keeps mode 0444" "444" \
+    "$(stat -c '%a' "$work_dir/config.yml" 2>/dev/null || stat -f '%Lp' "$work_dir/config.yml")"
+assert_contains "needs_sudo path writes the new block" "hostname: app.example.com" "$(cat "$work_dir/config.yml")"
+
+# Existing route, real run: DNS is ensured, but no backup and no restart
+setup; apply_fixture
+rc=0
+out="$(run_add keep.example.com 9000)" || rc=$?
+assert_eq "existing route exits 0" "0" "$rc"
+assert_eq "existing route -> dns only, no restart" "dns" "$(stub_verbs)"
+assert_eq "existing route -> no backup" "0" \
+    "$(count_files 'config.yml.bak.*')"
+
+echo
+echo "=== backups: no side effects in preview, unique names ==="
+setup; apply_fixture
+for i in 1 2 3 4 5 6 7; do
+    : > "$work_dir/config.yml.bak.2020010${i}-000000"
+done
+out="$(run_add app.example.com 8080 --diff)"
+assert_eq "--diff leaves existing backups alone" "7" \
+    "$(count_files 'config.yml.bak.*')"
+out="$(run_add app.example.com 8080 --dry-run)"
+assert_eq "--dry-run leaves existing backups alone" "7" \
+    "$(count_files 'config.yml.bak.*')"
+assert_eq "previews never call DNS / validate / restart" "" "$(stub_verbs)"
+
+setup; apply_fixture
+run_add one.example.com 8081 >/dev/null 2>&1 || true
+run_add two.example.com 8082 >/dev/null 2>&1 || true
+assert_eq "two quick applies keep two distinct backups" "2" \
+    "$(count_files 'config.yml.bak.*')"
+
+echo
+echo "=== catch-all: one anchored regex for count AND insertion ==="
+setup
+write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  #  - service: http_status:404
+  - hostname: keep.example.com
+    service: http://127.0.0.1:9000
+  - service: http_status:404
+EOF
+out="$(run_add app.example.com 8080 --dry-run)"
+assert_eq "commented-out catch-all -> exactly one insert" "1" \
+    "$(printf '%s\n' "$out" | grep -c -- '- hostname: app\.example\.com$' || true)"
+
+echo
+echo "=== add-route: --path is never shadowed by a host-only rule ==="
+setup
+write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - hostname: other.example.com
+    service: http://127.0.0.1:7000
+  # Added by cloudflare-tunnel-routes on 2026-01-01 | main site
+  - hostname: example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
+EOF
+out="$(run_add example.com 9001 --path '/api/.*' --dry-run)"
+preview="$(printf '%s\n' "$out" | sed -n '/^----- 8< -----$/,/^----- >8 -----$/p')"
+expected_preview='----- 8< -----
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - hostname: other.example.com
+    service: http://127.0.0.1:7000
+  - hostname: example.com
+    path: /api/.*
+    service: http://127.0.0.1:9001
+  # Added by cloudflare-tunnel-routes on 2026-01-01 | main site
+  - hostname: example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
+----- >8 -----'
+assert_eq "path rule lands above the host-only rule and its comment" "$expected_preview" "$preview"
+assert_contains "shadowing is reported" "above the existing host-only rule" "$out"
+
+echo
+echo "=== remove-route: indentation-aware blocks ==="
+setup
+write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - hostname: before.example.com
+    service: http://127.0.0.1:7000
+  - hostname: drop.example.com
+    service: https://127.0.0.1:8443
+    # self-signed upstream
+    originRequest:
+      noTLSVerify: true
+  - hostname: secure.example.com
+    service: http://127.0.0.1:7100
+    originRequest:
+      access:
+        required: true
+        teamName: example
+        audTag:
+          - aaaaaaaaaaaaaaaaaaaa
+          - bbbbbbbbbbbbbbbbbbbb
+  - hostname: after.example.com
+    service: http://127.0.0.1:7200
+  - service: http_status:404
+EOF
+add_unit cloudflared-alpha.service \
+    "/usr/bin/cloudflared --no-autoupdate --config $work_dir/config.yml tunnel run"
+rc=0
+out="$(run_remove drop.example.com --keep-dns)" || rc=$?
+assert_eq "remove block with comment + originRequest exits 0" "0" "$rc"
+expected="$(cat <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - hostname: before.example.com
+    service: http://127.0.0.1:7000
+  - hostname: secure.example.com
+    service: http://127.0.0.1:7100
+    originRequest:
+      access:
+        required: true
+        teamName: example
+        audTag:
+          - aaaaaaaaaaaaaaaaaaaa
+          - bbbbbbbbbbbbbbbbbbbb
+  - hostname: after.example.com
+    service: http://127.0.0.1:7200
+  - service: http_status:404
+EOF
+)"
+assert_eq "comment + originRequest removed, neighbours byte-identical" "$expected" "$(cat "$work_dir/config.yml")"
+assert_eq "remove-route order: validate, restart" \
+    "validate restart:cloudflared-alpha.service" "$(stub_verbs)"
+
+rc=0
+out="$(run_remove secure.example.com --keep-dns)" || rc=$?
+expected="$(cat <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - hostname: before.example.com
+    service: http://127.0.0.1:7000
+  - hostname: after.example.com
+    service: http://127.0.0.1:7200
+  - service: http_status:404
+EOF
+)"
+assert_eq "nested audTag list removed cleanly, neighbours byte-identical" "$expected" "$(cat "$work_dir/config.yml")"
+
+# remove-route: validation failure leaves the config alone
+cp "$work_dir/config.yml" "$work_dir/orig.yml"
+rc=0
+out="$(STUB_VALIDATE_FAIL=1 run_remove after.example.com --keep-dns)" || rc=$?
+assert_exit_nonzero "remove validate failure -> non-zero exit" "$rc"
+assert_eq "remove validate failure -> config untouched" "same" "$(config_unchanged)"
+
+echo
+echo "=== service targeting: the right unit, or none ==="
+setup
+apply_fixture
+: > "$work_dir/units"
+printf 'tunnel: 11111111-2222-3333-4444-555555555555\ncredentials-file: /tmp/x.json\ningress:\n  - service: http_status:404\n' > "$work_dir/primary.yml"
+add_unit cloudflared.service \
+    "/usr/bin/cloudflared --no-autoupdate --config $work_dir/primary.yml tunnel run"
+add_unit cloudflared-beta.service \
+    "/usr/bin/cloudflared --no-autoupdate --config $work_dir/config.yml tunnel run"
+rc=0
+out="$(run_add app.example.com 8080)" || rc=$?
+assert_eq "secondary config restarts its own unit" \
+    "validate dns restart:cloudflared-beta.service" "$(stub_verbs)"
+out="$(run_detect)"
+assert_contains "detect names the matching unit" "service_unit=cloudflared-beta.service" "$out"
+
+# A unit whose config path merely CONTAINS ours is not a match
+setup
+apply_fixture
+: > "$work_dir/units"
+add_unit cloudflared-gamma.service \
+    "/usr/bin/cloudflared --config $work_dir/config.yml.old tunnel run"
+out="$(run_detect)"
+assert_contains "substring config path is not a match" "service_mode=none" "$out"
+
+# Two units on the same config: ambiguous -> restart nothing, exit 3
+setup
+apply_fixture
+add_unit cloudflared-beta.service \
+    "/usr/bin/cloudflared --config=$work_dir/config.yml tunnel run"
+rc=0
+out="$(run_add app.example.com 8080)" || rc=$?
+assert_eq "ambiguous units -> exit 3" "3" "$rc"
+assert_not_contains "ambiguous units -> nothing restarted" "systemctl restart" "$(cat "$stub_log")"
+assert_contains "ambiguous units -> NOT reloaded warning" "NOT reloaded" "$out"
+assert_contains "ambiguous units -> config still applied (no rollback)" \
+    "hostname: app.example.com" "$(cat "$work_dir/config.yml")"
+
+# CFTR_SERVICE override wins over discovery
+rc=0
+out="$(CFTR_SERVICE=cloudflared-custom.service run_add two.example.com 8082)" || rc=$?
+assert_eq "CFTR_SERVICE honoured" "restart:cloudflared-custom.service" \
+    "$(stub_verbs | awk '{ print $NF }')"
+rc=0
+out="$(CFTR_SERVICE='-x;id' run_detect)" || rc=$?
+assert_exit_nonzero "detect rejects a malformed CFTR_SERVICE" "$rc"
+
+# Hand-run cloudflared: never signal it (SIGHUP kills cloudflared)
+setup
+apply_fixture
+: > "$work_dir/units"
+rc=0
+out="$(STUB_PGREP=1 run_add app.example.com 8080)" || rc=$?
+assert_eq "manual mode -> exit 3" "3" "$rc"
+assert_contains "manual mode -> restart-manually instructions" "Restart cloudflared manually" "$out"
+assert_not_contains "manual mode -> no SIGHUP" "SIGHUP" "$out"
+
+# Remotely-managed (--token) unit: local ingress is ignored - warn
+setup
+apply_fixture
+: > "$work_dir/units"
+add_unit cloudflared-delta.service \
+    "/usr/bin/cloudflared --config $work_dir/config.yml tunnel run --token eyFAKEFAKEFAKE"
+out="$(run_add app.example.com 8080 --dry-run)"
+assert_contains "--token unit -> remotely-managed warning" "remotely-managed" "$out"
+assert_not_contains "--token value never printed" "eyFAKE" "$out"
 
 echo
 echo "=== install.sh edge cases ==="
