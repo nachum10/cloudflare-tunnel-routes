@@ -24,7 +24,7 @@ bash scripts/add-route.sh demo.example.com 7860
 
 | Requirement | Why | How |
 |---|---|---|
-| `bash` 4+ | scripts use `mapfile`, `[[ ]]`, etc. | preinstalled on Linux/macOS; on Windows use WSL or Git Bash |
+| `bash` 4+ | scripts use `mapfile`, `${var,,}`, etc. | preinstalled on Linux; macOS ships 3.2, so `brew install bash`; Windows is untested, use WSL |
 | `awk`, `grep`, `sed`, `diff` | text processing | preinstalled everywhere |
 | `cloudflared` | the actual tunnel | see below |
 | Cloudflare account + domain | required for routing | free; sign up at https://dash.cloudflare.com |
@@ -32,28 +32,32 @@ bash scripts/add-route.sh demo.example.com 7860
 
 ### Install `cloudflared`
 
+Prefer the official, signed packages from the [Cloudflare package repository](https://pkg.cloudflare.com/) over a `releases/latest` download with no checksum.
+
 **macOS:**
 ```bash
 brew install cloudflared
+brew install bash    # macOS ships bash 3.2; the scripts need 4+
 ```
 
-**Debian / Ubuntu:**
+**Debian / Ubuntu** (official APT repository):
 ```bash
-curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
-sudo dpkg -i /tmp/cloudflared.deb
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+    | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install cloudflared
 ```
 
-**Generic Linux:**
+**RHEL / Fedora** (official RPM repository):
 ```bash
-sudo curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-    -o /usr/local/bin/cloudflared
-sudo chmod +x /usr/local/bin/cloudflared
+curl -fsSL https://pkg.cloudflare.com/cloudflared.repo | sudo tee /etc/yum.repos.d/cloudflared.repo
+sudo yum install cloudflared
 ```
 
-**Windows (PowerShell as admin):**
-```powershell
-winget install --id Cloudflare.cloudflared
-```
+**Other Linux:** see the [official downloads page](https://developers.cloudflare.com/tunnel/downloads/); verify any downloaded binary against the release checksums.
+
+**Windows:** untested. Use WSL and follow the Linux steps inside it.
 
 Verify:
 ```bash
@@ -148,8 +152,7 @@ Expected: `PASS: <N>`, `FAIL: 0`.
 
 | Symptom | Fix |
 |---|---|
-| `command not found: bash` on macOS | run with `/bin/bash scripts/...`; older macOS bash is fine |
-| `mapfile: command not found` | bash < 4. Upgrade with `brew install bash`. |
+| `mapfile: command not found` (e.g. on macOS) | bash < 4. `brew install bash`, then run the scripts with that bash (`bash scripts/...` once Homebrew's bin is first on `PATH`). macOS's `/bin/bash` (3.2) is **not** supported. |
 | Scripts not executable | `chmod +x scripts/*.sh` |
 | Claude Code doesn't pick up the skill | restart Claude Code; verify `~/.claude/skills/cloudflare-tunnel-routes/SKILL.md` exists and is readable |
 | `cloudflared: command not found` | install per the prerequisites table above |

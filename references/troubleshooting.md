@@ -60,7 +60,19 @@ The detection script sets `needs_sudo=true` automatically and the helper scripts
 3. `~/.cloudflared/config.yml`
 4. `~/.cloudflared/config.yaml`
 
-To target a non-default tunnel, set the env var `CLOUDFLARED_CONFIG=/path/to/other.yml` before running the scripts (then modify `detect.sh` to honour it - currently a TODO if needed).
+To target a non-default tunnel, set `CFTR_CONFIG=/path/to/other.yml` (and, if needed, `CFTR_BINARY=/path/to/cloudflared`) when running the scripts. They restart only the systemd unit whose `ExecStart` passes that config via `--config`; if none or several match, nothing is restarted and they exit 3. Name the unit with `CFTR_SERVICE=<unit>` in that case.
+
+## "needs root: re-run in a terminal or with sudo"
+
+The config is readable only by root and `sudo` needs a password, but there is no terminal to type it into (e.g. an AI agent or CI running the script). `detect.sh` uses `sudo -n` there instead of hanging on a hidden prompt, and exits 3. Run the command yourself in a terminal, or with `sudo`.
+
+## "refusing to run ... as root"
+
+When the config needs `sudo`, the scripts run `cloudflared tunnel ingress validate` as root. They refuse unless the `cloudflared` binary (after following symlinks) is owned by root and not group- or world-writable, because anyone able to rewrite it would otherwise get root. Install `cloudflared` from the official packages (owned by root), or fix the ownership/permissions.
+
+## "another cftr run holds the lock"
+
+Only one `add-route.sh` / `remove-route.sh` may change a config at a time. Wait for the other run to finish. Where `flock` is missing (macOS) the lock is a directory `config.yml.lock.d` next to the config; if a crashed run left it behind and nothing else is running, remove that directory.
 
 ## How to remove a DNS CNAME (the script can't)
 

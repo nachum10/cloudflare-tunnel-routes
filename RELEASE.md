@@ -96,7 +96,8 @@ And eyeball:
 
 | Version | Highlights |
 |---------|-----------|
-| [`v0.1.0`](https://github.com/nachum10/cloudflare-tunnel-routes/releases/tag/v0.1.0) (2026-05-10) | Initial public release. Full CLI: `add-route`, `remove-route`, `list-routes`, `detect`, `setup-new-tunnel`. `--dry-run`, `--diff`, `--comment`. `CFTR_CONFIG` / `CFTR_BINARY` env overrides. `yq` optional path for `list-routes`. 78-test hermetic suite. CI on every push/PR. Claude Code skill + `AGENTS.md` + `llms.txt` + Cursor Project Rule for AI agents. |
+| [`v0.1.0`](https://github.com/nachum10/cloudflare-tunnel-routes/releases/tag/v0.1.0) (2026-05-10) | Initial public release. Full CLI: `add-route`, `remove-route`, `list-routes`, `detect`, `setup-new-tunnel`. `--dry-run`, `--diff`, `--comment`. `CFTR_CONFIG` / `CFTR_BINARY` env overrides. `yq` optional path for `list-routes`. 72-test hermetic suite. CI on every push/PR. Claude Code skill + `AGENTS.md` + `llms.txt` + Cursor Project Rule for AI agents. |
+| `v0.2.0` (unreleased, not tagged yet) | Security hardening: YAML/awk injection fixes, validate-first apply path with atomic replace and rollback, targeted restarts (`CFTR_SERVICE`, exit 3), per-config locking, safer `detect.sh` / `setup-new-tunnel.sh`, 200+ hermetic tests, pinned CI with shellcheck. Details in [`CHANGELOG.md`](./CHANGELOG.md). |
 
 (Future entries get appended here when each release is cut.)
 

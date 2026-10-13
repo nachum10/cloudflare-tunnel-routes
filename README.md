@@ -27,7 +27,7 @@ See [`USE_CASES.md`](./USE_CASES.md) for the agent-readable decision matrix and 
 [![tests](https://github.com/nachum10/cloudflare-tunnel-routes/actions/workflows/test.yml/badge.svg)](https://github.com/nachum10/cloudflare-tunnel-routes/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Shell: Bash](https://img.shields.io/badge/Shell-Bash-green.svg)]()
-[![Platforms: Linux | macOS | Windows](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)]()
+[![Platforms: Linux (CI-tested) | macOS (bash 4+, untested) | Windows via WSL](https://img.shields.io/badge/Platforms-Linux%20(CI)%20%7C%20macOS%20(untested)%20%7C%20WSL-blue.svg)]()
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-D97757?logo=anthropic&logoColor=white)](https://docs.claude.com/en/docs/claude-code/skills)
 [![Agent-installable](https://img.shields.io/badge/AI%20agents-installable-7c3aed)](./AGENTS.md)
 [![Zero dependencies](https://img.shields.io/badge/dependencies-zero-success)]()
@@ -88,7 +88,7 @@ add-route.sh demo.example.com 7860
 # (Free TLS, free DDoS protection, persistent across restarts.)
 ```
 
-The skill is **portable**: works on any machine, any Cloudflare account, any Linux distribution, macOS, and Windows. The only requirement is that `cloudflared` is installed.
+The skill is **portable** across Cloudflare accounts and Linux distributions (that is what CI tests). On macOS it needs bash 4+ (`brew install bash`); the BSD-tool code paths are written but not CI-tested. Windows is untested: use WSL. Besides bash, the only requirement is that `cloudflared` is installed.
 
 ---
 
@@ -151,32 +151,36 @@ The flow is:
 | `cloudflared` binary | See OS-specific install commands below |
 | Cloudflare account (free) | https://dash.cloudflare.com/sign-up |
 | A domain in your Cloudflare account | Buy from any registrar (~$10/year), or transfer an existing one. Add it to Cloudflare and point its nameservers. |
-| `bash` (4+) and `awk` (gawk or busybox) | Pre-installed on Linux/macOS; use WSL or Git Bash on Windows |
+| `bash` 4+ and `awk` (mawk, gawk or busybox) | Pre-installed on Linux. macOS ships bash 3.2: `brew install bash` first. Windows: untested, use WSL. |
 
 ### Installing `cloudflared`
 
-**Debian/Ubuntu (recommended for servers):**
+Prefer the official, signed packages from the [Cloudflare package repository](https://pkg.cloudflare.com/) over downloading a `releases/latest` binary with no checksum.
+
+**Debian/Ubuntu (recommended for servers)** - official APT repository:
 ```bash
-curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
-sudo dpkg -i /tmp/cloudflared.deb
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+    | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install cloudflared
 ```
 
-**Generic Linux (binary):**
+**RHEL/Fedora** - official RPM repository:
 ```bash
-curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-    -o /usr/local/bin/cloudflared
-sudo chmod +x /usr/local/bin/cloudflared
+curl -fsSL https://pkg.cloudflare.com/cloudflared.repo | sudo tee /etc/yum.repos.d/cloudflared.repo
+sudo yum install cloudflared
 ```
+
+**Other Linux:** see Cloudflare's [downloads page](https://developers.cloudflare.com/tunnel/downloads/); if you download a binary from GitHub releases, verify it against the release's published checksums.
 
 **macOS:**
 ```bash
 brew install cloudflared
+brew install bash    # the scripts need bash 4+; macOS ships 3.2
 ```
 
-**Windows (PowerShell as admin):**
-```powershell
-winget install --id Cloudflare.cloudflared
-```
+**Windows:** untested. Use WSL and follow the Linux steps inside it.
 
 Verify:
 ```bash
@@ -234,7 +238,7 @@ bash scripts/add-route.sh app.example.com 8080
 
 Output:
 ```
-==> Tunnel: bc41dca4-c261-409c-8a15-60f26d790fed
+==> Tunnel: 00000000-1111-2222-3333-444444444444
 ==> Config: /etc/cloudflared/config.yml
 ==> Adding: app.example.com -> http://127.0.0.1:8080
 
@@ -277,8 +281,8 @@ Outputs key=value lines:
 ```
 binary=/usr/local/bin/cloudflared
 config=/etc/cloudflared/config.yml
-tunnel_id=bc41dca4-c261-409c-8a15-60f26d790fed
-credentials=/root/.cloudflared/bc41dca4-c261-409c-8a15-60f26d790fed.json
+tunnel_id=00000000-1111-2222-3333-444444444444
+credentials=/home/you/.cloudflared/00000000-1111-2222-3333-444444444444.json
 needs_sudo=true
 service_mode=systemd
 service_unit=cloudflared.service
@@ -297,7 +301,7 @@ bash scripts/list-routes.sh
 ```
 
 ```
-Tunnel: bc41dca4-c261-409c-8a15-60f26d790fed
+Tunnel: 00000000-1111-2222-3333-444444444444
 Config: /etc/cloudflared/config.yml
 ---
 app.example.com                                      -> http://127.0.0.1:8080
@@ -318,7 +322,9 @@ bash scripts/add-route.sh api.example.com http://127.0.0.1:3000
 bash scripts/add-route.sh example.com 9000 --path "/docs.*"
 ```
 
-**Idempotent**: re-running with the same args is safe - duplicate DNS records and config blocks are detected and skipped.
+**Idempotent**: re-running with the same args is safe - an existing ingress block is detected (config untouched, no restart, exit 0) and a CNAME that already routes to this tunnel is accepted.
+
+**DNS conflicts are never overwritten automatically.** If the hostname already has an A/AAAA/CNAME record pointing elsewhere, the script stops (config untouched) and prints the manual, opt-in command `cloudflared tunnel route dns --overwrite-dns <tunnel> <hostname>`. Run it yourself only if you really mean to repoint that name, then re-run `add-route.sh`.
 
 ### `remove-route.sh` - Remove an ingress block
 
@@ -338,9 +344,9 @@ bash scripts/setup-new-tunnel.sh my-server
 
 Performs:
 1. `cloudflared tunnel login` (opens browser, requires confirmation)
-2. `cloudflared tunnel create my-server`
-3. Writes a starter `~/.cloudflared/config.yml`
-4. Optionally installs as a systemd service (Linux only)
+2. `cloudflared tunnel create my-server` (name: letters, digits, `.`, `_`, `-`; the tunnel ID is read from cloudflared's "Created tunnel ... with id ..." line, or from `cloudflared tunnel info --output json` for an existing tunnel)
+3. Writes a starter `~/.cloudflared/config.yml` - but **never over an existing one**: then it prints the `tunnel:` / `credentials-file:` lines to change and exits 3 instead of claiming success
+4. Optionally installs as a systemd service (Linux only): asks on a terminal, `--yes` installs without asking, otherwise skipped. An existing `/etc/cloudflared/config.yml` is backed up first.
 
 ---
 
@@ -381,13 +387,15 @@ The scripts restart only the systemd unit whose `ExecStart` contains `--config <
 
 ## Tests
 
-A hermetic test suite lives in `tests/run-tests.sh` (159 tests; every external command - cloudflared, systemctl, sudo - is a logging stub, so no real DNS or service calls):
+A hermetic test suite lives in `tests/run-tests.sh` (200+ tests; every external command - cloudflared, systemctl, sudo, pgrep - is a logging stub on `PATH`, so no real DNS, service or sudo calls):
 
 ```bash
 bash tests/run-tests.sh
 ```
 
-Covers input validation, idempotency, catch-all sanity checks, remove-route correctness, and `detect.sh` rejection of tampered configs. CI runs the same suite on every push and PR — see the **tests** badge at the top.
+Covers input validation and injection attempts, the apply path (validate, DNS, backup, atomic replace, restart, rollback), locking, service targeting, idempotency, catch-all sanity checks, remove-route correctness, `setup-new-tunnel.sh`, and `detect.sh` rejection of tampered configs. The yq tests run when `yq` is on `PATH`. CI runs the suite plus `shellcheck` on every push and PR — see the **tests** badge at the top.
+
+A few environment variables exist **only for the test suite** and are not supported settings: `CFTR_TRUST_BINARY=1` (skip the root-owned-binary check, because the stub binary is user-owned), `CFTR_LOCK_IMPL=mkdir` (force the mkdir lock fallback), `CFTR_SYSTEM_DIR` (replaces `/etc/cloudflared`).
 
 ---
 
@@ -460,11 +468,12 @@ bash scripts/add-route.sh webhooks.example.com 4000
 ├── install.sh                      (symlink installer)
 ├── .gitignore
 ├── scripts/
-│   ├── detect.sh                   (runtime detection - 60 lines)
-│   ├── list-routes.sh              (config parser - 30 lines)
-│   ├── add-route.sh                (DNS + ingress + validate + reload - 170 lines)
-│   ├── remove-route.sh             (ingress removal + reload - 100 lines)
-│   └── setup-new-tunnel.sh         (one-time setup - 100 lines)
+│   ├── detect.sh                   (runtime detection, validated key=value output)
+│   ├── list-routes.sh              (read-only route listing; yq if available)
+│   ├── add-route.sh                (validate + DNS + atomic ingress edit + restart)
+│   ├── remove-route.sh             (ingress removal + atomic edit + restart)
+│   ├── setup-new-tunnel.sh         (one-time setup)
+│   └── lib.sh                      (shared helpers: route blocks, lock, replace, restart)
 └── references/
     └── troubleshooting.md          (loaded by Claude on demand)
 ```
@@ -530,7 +539,7 @@ See [`references/troubleshooting.md`](./references/troubleshooting.md) for the f
 **A:** The transport is: the tunnel itself is an outbound TLS connection from your machine to Cloudflare, so nothing inbound is opened on your firewall, and Cloudflare terminates TLS at the edge with their certificate. **The application you expose is not** - by default the URL is public to anyone who can reach Cloudflare. If the local service has no auth, anyone with the URL can hit it. For anything sensitive add **Cloudflare Access** (SSO / IP allowlist / one-time PIN), enable rate limiting / WAF rules, and consider a Cloudflare Tunnel "service token" if you only want machine-to-machine access. This skill does **not** configure those for you.
 
 ### Q: Can I run multiple tunnels on the same machine?
-**A:** Yes, but `detect.sh` picks the first config it finds. To target a specific tunnel, point it at the right `config.yml` manually or modify `detect.sh`.
+**A:** Yes. `detect.sh` picks the first config it finds, so point the scripts at the one you want with `CFTR_CONFIG=/path/to/config.yml` (no need to edit any script). They restart only the systemd unit whose `ExecStart` uses that config; set `CFTR_SERVICE=<unit>` if that unit can't be found automatically. See [Dry-run and multi-tunnel hosts](#dry-run-and-multi-tunnel-hosts) above.
 
 ### Q: What if my IP changes?
 **A:** No issue - the tunnel is outbound, so dynamic IPs work fine. This makes it perfect for home servers, laptops, or NATed environments.
@@ -553,9 +562,9 @@ PRs welcome. Before submitting:
 4. Update README + `references/troubleshooting.md` if you change behavior.
 
 Areas where help is welcome:
-- Windows-native PowerShell port (currently requires WSL/Git Bash).
+- Windows-native PowerShell port (Windows is untested today; use WSL).
 - DNS deletion via Cloudflare API (requires API token handling).
-- macOS / BSD compatibility testing (the test suite assumes GNU coreutils).
+- macOS / BSD CI job (the scripts fall back to BSD `stat` and a mkdir lock, but nothing runs them on macOS in CI yet, and bash 3.2 is not supported).
 
 ---
 
