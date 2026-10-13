@@ -34,7 +34,7 @@ Don't use it when: the user wants to deploy to managed hosting (Vercel / Fly / H
 
 ## Tests
 
-- [tests/run-tests.sh](./tests/run-tests.sh): hermetic test suite (78 tests, no real cloudflared / DNS calls). CI runs this on every push and PR.
+- [tests/run-tests.sh](./tests/run-tests.sh): hermetic test suite (149 tests; every external command - cloudflared, systemctl, sudo - is a logging stub, so no real DNS or service calls). CI runs this on every push and PR.
 
 ## Safety properties
 

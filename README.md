@@ -135,12 +135,12 @@ The `config.yml` ingress rules tell `cloudflared` which incoming hostname maps t
 
 The flow is:
 
-1. **Detection** - finds your `config.yml` (in `/etc/cloudflared/`, `~/.cloudflared/`, or wherever), reads tunnel ID, figures out whether `sudo` and `systemctl` are needed.
-2. **DNS** - calls `cloudflared tunnel route dns` to create the CNAME pointing to the tunnel.
-3. **Ingress** - inserts a new `- hostname / service` block immediately above the catch-all `service: http_status:404`.
-4. **Validate** - runs `cloudflared tunnel ingress validate` to confirm the new YAML is valid.
-5. **Reload** - `systemctl restart cloudflared` (systemd mode) or `pkill -HUP cloudflared` (manual mode). The change is live in ~2 seconds.
-6. **Auto-rollback** - if validation fails, the timestamped backup is restored automatically.
+1. **Detection** - finds your `config.yml` (in `/etc/cloudflared/`, `~/.cloudflared/`, or wherever), reads tunnel ID, figures out whether `sudo` is needed and which systemd unit runs this config (the one whose `ExecStart` has `--config <file>`, or `CFTR_SERVICE`).
+2. **Ingress** - builds the new config with a `- hostname / service` block immediately above the catch-all `service: http_status:404` (or above an existing host-only rule for the same hostname when you add a `--path`, so it is not shadowed).
+3. **Validate** - runs `cloudflared tunnel ingress validate` on the new config BEFORE anything changes. Invalid: stop, no DNS, config untouched.
+4. **DNS** - calls `cloudflared tunnel route dns` to create the CNAME pointing to the tunnel. Any error (including a conflicting record that points elsewhere) stops the run with the config untouched.
+5. **Swap** - backs up `config.yml`, then replaces it atomically, keeping its owner, group and mode.
+6. **Restart** - `systemctl restart <that unit>`. The change is live in ~2 seconds. If the restart fails, the backup is restored and the unit restarted again. If no single unit can be identified, nothing is restarted and the script exits 3 with the manual command (cloudflared has no reload signal; SIGHUP stops it).
 
 ---
 
@@ -238,14 +238,19 @@ Output:
 ==> Config: /etc/cloudflared/config.yml
 ==> Adding: app.example.com -> http://127.0.0.1:8080
 
+==> Inserting ingress block before catch-all...
+
+==> Validating new config...
+Validating rules from /etc/cloudflared/config.yml.cftr-tmp.Xk3PqA
+OK
+
 ==> Creating DNS CNAME for app.example.com...
 2026-05-10T12:34:56Z INF Added CNAME app.example.com which will route to this tunnel
-==> Backing up config to /etc/cloudflared/config.yml.bak.20260510-123456
-==> Inserting ingress block before catch-all...
-==> Validating config...
-Validating rules from /etc/cloudflared/config.yml
-OK
-==> Restarting cloudflared (systemd)...
+
+==> Backed up config to /etc/cloudflared/config.yml.bak.20260510-123456.a1B2c3
+==> Config updated.
+
+==> Restarting cloudflared.service...
     Active.
 
 ==> Done. Test with: curl -I https://app.example.com/
@@ -276,9 +281,14 @@ tunnel_id=bc41dca4-c261-409c-8a15-60f26d790fed
 credentials=/root/.cloudflared/bc41dca4-c261-409c-8a15-60f26d790fed.json
 needs_sudo=true
 service_mode=systemd
+service_unit=cloudflared.service
+service_candidates=
+remote_managed=false
 ```
 
-Exit 0 if a tunnel is detected, 1 if not.
+`service_mode` is `systemd` (one unit's `ExecStart` passes this config via `--config`, or `CFTR_SERVICE` is set), `ambiguous` (several units do; listed in `service_candidates`), `manual` (cloudflared runs outside systemd) or `none`. `remote_managed=true` means that unit runs `tunnel run --token`, so cloudflared ignores the local ingress rules.
+
+Exit 0 if a tunnel is detected, 1 if not, 2 if a value looks tampered.
 
 ### `list-routes.sh` - Show all current routes
 
@@ -363,11 +373,15 @@ If you have more than one tunnel/config on a host, the auto-detection picks the 
 ```bash
 CFTR_CONFIG=/etc/cloudflared/secondary.yml bash scripts/add-route.sh app.example.com 8080
 CFTR_BINARY=/opt/cloudflared/bin/cloudflared bash scripts/list-routes.sh
+CFTR_SERVICE=cloudflared-secondary.service CFTR_CONFIG=/etc/cloudflared/secondary.yml \
+    bash scripts/add-route.sh app.example.com 8080
 ```
+
+The scripts restart only the systemd unit whose `ExecStart` contains `--config <that config>`. If none or several match, they restart nothing and exit **3** ("config updated, NOT reloaded") with the command to run by hand; `CFTR_SERVICE` names the unit explicitly.
 
 ## Tests
 
-A hermetic test suite lives in `tests/run-tests.sh` (78 tests, no real cloudflared / DNS calls):
+A hermetic test suite lives in `tests/run-tests.sh` (149 tests; every external command - cloudflared, systemctl, sudo - is a logging stub, so no real DNS or service calls):
 
 ```bash
 bash tests/run-tests.sh
@@ -465,14 +479,17 @@ Every destructive operation includes safety nets:
 
 | Risk | Mitigation |
 |---|---|
-| Edit corrupts `config.yml` | Timestamped backup created BEFORE every edit (`config.yml.bak.<timestamp>`) |
-| Validation fails after edit | Backup automatically restored; cloudflared NOT restarted |
-| Duplicate DNS / ingress | Detected; the script reports "already exists" and skips |
+| Edit corrupts `config.yml` | New config validated BEFORE anything changes; unique backup (`config.yml.bak.<timestamp>.<random>`, 5 kept) before every edit; atomic replace keeps owner, group and mode |
+| Validation fails | Nothing happens: no DNS record, config untouched |
+| DNS record conflicts with an existing one | Error, config untouched; the `--overwrite-dns` command is printed, never run |
+| Existing ingress block | Detected; config left alone, nothing restarted |
+| DNS created but a later step fails | Dashboard instructions for deleting the orphaned CNAME are printed (DNS is never deleted automatically) |
+| Wrong tunnel restarted on multi-tunnel hosts | Only the unit whose `ExecStart` has `--config <this config>` (or `CFTR_SERVICE`) is restarted; otherwise none, exit 3 |
+| Service won't start after restart | Backup restored, unit restarted again, exit 1; state via `systemctl show` (never `status`, which can print a `--token`) |
 | `sudo` not available | Detected by `needs_sudo` check; script exits with clear error |
-| Catch-all 404 ordering broken | Insert always happens BEFORE the `http_status:404` line |
-| Service won't start after restart | Logs are dumped via `systemctl status` for debugging |
+| Catch-all 404 ordering broken | Insert always happens BEFORE the `http_status:404` line; a commented-out catch-all is ignored |
 
-If a script fails midway, your previous `config.yml` is in `config.yml.bak.<timestamp>` - restore with `cp`.
+If a script fails midway, your previous `config.yml` is in `config.yml.bak.<timestamp>.<random>` - restore with `cp`.
 
 ---
 
@@ -481,7 +498,7 @@ If a script fails midway, your previous `config.yml` is in `config.yml.bak.<time
 See [`references/troubleshooting.md`](./references/troubleshooting.md) for the full guide. Common issues:
 
 - **"404 Not Found" from the tunnel after add** - DNS propagation lag (~30-60s) or local service not listening on the configured port. Test with `curl -I http://127.0.0.1:<port>` first.
-- **"A, AAAA, or CNAME record with that host already exists"** - Pre-existing DNS record blocks the CNAME. Delete it via the Cloudflare dashboard, then re-run `add-route.sh`.
+- **"A, AAAA, or CNAME record with that host already exists"** - Pre-existing DNS record blocks the CNAME; `add-route.sh` stops with the config untouched. Delete the record via the Cloudflare dashboard (or, if you really mean to repoint it, run the printed `--overwrite-dns` command yourself), then re-run `add-route.sh`.
 - **"tunnel not found" / "credentials file not found"** - Config copied between machines but credentials weren't. Run `setup-new-tunnel.sh` again or copy the credentials JSON.
 - **Permission denied on `/etc/cloudflared/config.yml`** - The scripts auto-detect `needs_sudo`; just make sure `sudo` is available.
 
