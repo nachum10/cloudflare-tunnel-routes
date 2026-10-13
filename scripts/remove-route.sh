@@ -83,11 +83,14 @@ detect_out="$(bash "$SCRIPT_DIR/detect.sh")" || {
     rc=$?
     if [ "$rc" = "2" ]; then
         echo "ERROR: detect.sh refused to emit values - config may be tampered." >&2
+    elif [ "$rc" = "3" ]; then
+        : # detect.sh already printed the "needs root" error
     else
         echo "ERROR: No cloudflared tunnel detected." >&2
     fi
     exit 1
 }
+# shellcheck disable=SC2034  # every key is parsed; not all are used here
 while IFS='=' read -r k v; do
     case "$k" in
         binary)       binary="$v" ;;
@@ -118,9 +121,17 @@ on_exit() {
     local rc=$?
     [ -n "$tmp" ] && rm -f -- "$tmp"
     [ -n "$staged" ] && $SUDO rm -f -- "$staged"
+    cftr_lock_release
     return "$rc"
 }
 trap on_exit EXIT
+
+# Real runs: trustworthy binary for the root-run validate, and an
+# exclusive lock from the first read of the config to the restart.
+if [ "$dry_run" != "true" ]; then
+    cftr_check_binary || exit 1
+    cftr_lock_acquire || exit 1
+fi
 
 [ "$dry_run" = "true" ] && echo "==> DRY RUN: no changes will be made"
 if [ "$remote_managed" = "true" ]; then

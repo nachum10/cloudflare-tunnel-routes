@@ -69,6 +69,24 @@ case " $* " in
         fi
         echo "OK"
         ;;
+    *" tunnel create "*)
+        name="${*: -1}"
+        if [ -n "${STUB_CREATE_EXISTS:-}" ]; then
+            echo "failed to create tunnel: Create Tunnel API call failed: tunnel with name already exists" >&2
+            exit 1
+        fi
+        id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        mkdir -p "$HOME/.cloudflared"
+        echo '{}' > "$HOME/.cloudflared/$id.json"
+        echo "Tunnel credentials written to $HOME/.cloudflared/$id.json. Keep this file secret. To revoke these credentials, delete the tunnel."
+        echo
+        echo "Created tunnel $name with id $id"
+        ;;
+    *" tunnel info "*)
+        name="${*: -1}"
+        printf '{\n  "id": "%s",\n  "name": "%s",\n  "createdAt": "2026-01-01T00:00:00Z",\n  "conns": []\n}\n' \
+            "${STUB_INFO_ID:-12345678-90ab-4cde-8f01-234567890abc}" "${STUB_INFO_NAME:-$name}"
+        ;;
     *) echo "[stub-cloudflared] $*" ;;
 esac
 exit 0
@@ -104,6 +122,12 @@ STUB
     cat > "$stub_dir/sudo" <<'STUB'
 #!/usr/bin/env bash
 echo "sudo $*" >> "$(dirname "$0")/../stub.log"
+if [ -n "${STUB_SUDO_NOPASS:-}" ]; then
+    echo "sudo: a password is required" >&2
+    exit 1
+fi
+[ "${1:-}" = "-n" ] && shift
+[ -n "${STUB_SUDO_LOGONLY:-}" ] && exit 0
 exec "$@"
 STUB
     cat > "$stub_dir/pgrep" <<'STUB'
@@ -240,22 +264,22 @@ assert_exit_nonzero() {
 
 run_add() {
     PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
-        bash "$SCRIPTS/add-route.sh" "$@" 2>&1
+        bash "$SCRIPTS/add-route.sh" "$@" 2>&1 </dev/null
 }
 
 run_remove() {
     PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
-        bash "$SCRIPTS/remove-route.sh" "$@" 2>&1
+        bash "$SCRIPTS/remove-route.sh" "$@" 2>&1 </dev/null
 }
 
 run_list() {
     PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
-        bash "$SCRIPTS/list-routes.sh" 2>&1
+        bash "$SCRIPTS/list-routes.sh" 2>&1 </dev/null
 }
 
 run_detect() {
     PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/config.yml" CFTR_BINARY="$fake_bin" \
-        bash "$SCRIPTS/detect.sh" 2>&1
+        bash "$SCRIPTS/detect.sh" 2>&1 </dev/null
 }
 
 # --- tests -----------------------------------------------------------------
@@ -878,8 +902,16 @@ assert_eq "atomic replace keeps owner" "$(id -u)" \
 # Read-only config -> needs_sudo path (the sudo stub runs as us)
 setup; apply_fixture
 chmod 0444 "$work_dir/config.yml"
+# The stub binary is user-owned: running it as root must be refused...
 rc=0
 out="$(run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "sudo + user-owned binary -> refused" "$rc"
+assert_contains "sudo + user-owned binary -> clear message" "refusing to run" "$out"
+assert_eq "sudo + user-owned binary -> config untouched" "same" "$(config_unchanged)"
+assert_not_contains "sudo + user-owned binary -> no DNS call" "route dns" "$(cat "$stub_log")"
+# ...unless the suite-only override says the binary is trusted.
+rc=0
+out="$(CFTR_TRUST_BINARY=1 run_add app.example.com 8080)" || rc=$?
 assert_eq "needs_sudo path exits 0" "0" "$rc"
 assert_contains "needs_sudo path goes through sudo" "sudo mv -f" "$(cat "$stub_log")"
 assert_eq "needs_sudo path keeps mode 0444" "444" \
@@ -1146,6 +1178,205 @@ assert_contains "--token unit -> remotely-managed warning" "remotely-managed" "$
 assert_not_contains "--token value never printed" "eyFAKE" "$out"
 
 echo
+echo "=== detect.sh: tunnel names, paths with spaces, strict rejects ==="
+setup
+write_fixture <<'EOF'
+tunnel: my-tunnel.prod_1
+credentials-file: "/home/user/my creds/tunnel.json"   # quoted, with a space
+ingress:
+  - service: http_status:404
+EOF
+rc=0
+out="$(run_detect)" || rc=$?
+assert_eq "tunnel NAME accepted (exit 0)" "0" "$rc"
+assert_contains "tunnel NAME emitted" "tunnel_id=my-tunnel.prod_1" "$out"
+assert_contains "credentials path with a space accepted" \
+    "credentials=/home/user/my creds/tunnel.json" "$out"
+
+mkdir -p "$work_dir/conf dir"
+cp "$work_dir/config.yml" "$work_dir/conf dir/config.yml"
+rc=0
+out="$(PATH="$stub_dir:$PATH" CFTR_CONFIG="$work_dir/conf dir/config.yml" CFTR_BINARY="$fake_bin" \
+    bash "$SCRIPTS/detect.sh" 2>&1 </dev/null)" || rc=$?
+assert_eq "config path with a space accepted" "0" "$rc"
+
+for bad in 'abc;id' 'abc$(id)' '-rf' 'a b'; do
+    printf 'tunnel: %s\ncredentials-file: /tmp/x.json\ningress:\n  - service: http_status:404\n' "$bad" \
+        > "$work_dir/config.yml"
+    rc=0
+    out="$(run_detect)" || rc=$?
+    assert_eq "tunnel value '$bad' rejected (exit 2)" "2" "$rc"
+done
+for bad in '/tmp/$(id).json' '/tmp/a"b.json' '/tmp/a;b.json' '/tmp/`id`.json'; do
+    printf 'tunnel: 11111111-2222-3333-4444-555555555555\ncredentials-file: %s\ningress:\n  - service: http_status:404\n' "$bad" \
+        > "$work_dir/config.yml"
+    rc=0
+    out="$(run_detect)" || rc=$?
+    assert_eq "credentials '$bad' rejected (exit 2)" "2" "$rc"
+done
+# A newline in the config path: grep-based validation passed it line by line
+nl_dir="$work_dir/a
+b"
+mkdir -p "$nl_dir"
+printf 'tunnel: 11111111-2222-3333-4444-555555555555\ncredentials-file: /tmp/x.json\ningress:\n  - service: http_status:404\n' \
+    > "$nl_dir/config.yml"
+rc=0
+out="$(PATH="$stub_dir:$PATH" CFTR_CONFIG="$nl_dir/config.yml" CFTR_BINARY="$fake_bin" \
+    bash "$SCRIPTS/detect.sh" 2>&1 </dev/null)" || rc=$?
+assert_eq "config path with a newline rejected (exit 2)" "2" "$rc"
+
+echo
+echo "=== detect.sh: root-only config, sudo needs a password ==="
+if [ "$(id -u)" = "0" ]; then
+    echo "  SKIP  running as root - cannot make the config unreadable"
+else
+    setup
+    write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - service: http_status:404
+EOF
+    chmod 000 "$work_dir/config.yml"
+    rc=0
+    out="$(STUB_SUDO_NOPASS=1 run_detect)" || rc=$?
+    assert_eq "unreadable config + sudo needs password -> exit 3" "3" "$rc"
+    assert_contains "needs-root message" "needs root" "$out"
+    assert_contains "detect tried sudo -n (never a hidden prompt)" "sudo -n cat" "$(cat "$stub_log")"
+    rc=0
+    out="$(STUB_SUDO_NOPASS=1 run_add app.example.com 8080 --dry-run)" || rc=$?
+    assert_exit_nonzero "add-route stops when root is needed" "$rc"
+    assert_contains "add-route shows the needs-root error" "needs root" "$out"
+    assert_not_contains "add-route does not claim 'no tunnel'" "No cloudflared tunnel detected" "$out"
+    chmod 600 "$work_dir/config.yml"
+fi
+
+echo
+echo "=== locking: one mutating run at a time ==="
+if command -v flock >/dev/null 2>&1; then
+    setup; apply_fixture
+    : > "$work_dir/config.yml.lock"
+    exec 8<"$work_dir/config.yml.lock"
+    flock -x 8
+    rc=0
+    out="$(run_add app.example.com 8080)" || rc=$?
+    exec 8<&-
+    assert_exit_nonzero "flock held -> second run fails" "$rc"
+    assert_contains "flock held -> clear message" "another cftr run holds the lock" "$out"
+    assert_eq "flock held -> config unchanged" "same" "$(config_unchanged)"
+    assert_not_contains "flock held -> no DNS call" "route dns" "$(cat "$stub_log")"
+    rc=0
+    out="$(run_add app.example.com 8080)" || rc=$?
+    assert_eq "flock released -> run succeeds" "0" "$rc"
+    out="$(run_add other.example.com 8081 --dry-run)"
+    assert_not_contains "previews never wait for the lock" "holds the lock" "$out"
+else
+    echo "  SKIP  flock not installed - mkdir fallback tested below"
+fi
+
+setup; apply_fixture
+mkdir "$work_dir/config.yml.lock.d"
+rc=0
+out="$(CFTR_LOCK_IMPL="mkdir" run_remove keep.example.com --keep-dns)" || rc=$?
+assert_exit_nonzero "mkdir lock held -> remove-route fails" "$rc"
+assert_contains "mkdir lock held -> clear message" "another cftr run holds the lock" "$out"
+assert_eq "mkdir lock held -> config unchanged" "same" "$(config_unchanged)"
+rmdir "$work_dir/config.yml.lock.d"
+rc=0
+out="$(CFTR_LOCK_IMPL="mkdir" run_remove keep.example.com --keep-dns)" || rc=$?
+assert_eq "mkdir lock free -> remove-route succeeds" "0" "$rc"
+assert_eq "mkdir lock removed on exit" "absent" \
+    "$([ -e "$work_dir/config.yml.lock.d" ] && echo present || echo absent)"
+
+echo
+echo "=== idempotency: same command twice ==="
+setup; apply_fixture
+run_add app.example.com 8080 >/dev/null 2>&1 || true
+: > "$stub_log"
+rc=0
+out="$(run_add app.example.com 8080)" || rc=$?
+assert_eq "repeat add-route exits 0" "0" "$rc"
+assert_contains "repeat add-route says so" "already exists" "$out"
+assert_contains "repeat add-route: no restart" "no restart needed" "$out"
+assert_eq "repeat add-route: only the DNS check runs" "dns" "$(stub_verbs)"
+backups_before="$(count_files 'config.yml.bak.*')"
+rc=0
+out="$(run_remove missing.example.com --keep-dns)" || rc=$?
+assert_eq "remove of a missing route exits 0" "0" "$rc"
+assert_contains "remove of a missing route says so" "nothing to do" "$out"
+assert_eq "remove of a missing route: no new backup" "$backups_before" "$(count_files 'config.yml.bak.*')"
+
+echo
+echo "=== setup-new-tunnel.sh (stubbed cloudflared, HOME and sudo) ==="
+run_setup() {
+    PATH="$stub_dir:$PATH" HOME="$work_dir/home" CFTR_SYSTEM_DIR="$work_dir/etc" \
+        bash "$SCRIPTS/setup-new-tunnel.sh" "$@" 2>&1 </dev/null
+}
+setup_home() {
+    mkdir -p "$work_dir/home/.cloudflared" "$work_dir/etc"
+    : > "$work_dir/home/.cloudflared/cert.pem"
+}
+
+setup; setup_home
+rc=0
+out="$(run_setup 'bad;name')" || rc=$?
+assert_exit_nonzero "setup rejects a bad tunnel name" "$rc"
+assert_contains "setup bad-name message" "invalid tunnel name" "$out"
+assert_not_contains "setup bad name -> cloudflared never called" "cloudflared" "$(cat "$stub_log")"
+
+setup; setup_home
+rc=0
+out="$(run_setup demo-tunnel)" || rc=$?
+assert_eq "setup happy path exits 0" "0" "$rc"
+assert_contains "setup takes the ID from 'Created tunnel ... with id'" \
+    "tunnel: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" "$(cat "$work_dir/home/.cloudflared/config.yml")"
+assert_contains "setup claims completion only after writing" "Setup complete" "$out"
+assert_contains "setup on non-TTY skips the service prompt" "Not a terminal" "$out"
+assert_not_contains "setup on non-TTY runs no sudo" "sudo " "$(cat "$stub_log")"
+
+setup; setup_home
+printf 'tunnel: 99999999-8888-7777-6666-555555555555\n# my routes\n' > "$work_dir/home/.cloudflared/config.yml"
+cp "$work_dir/home/.cloudflared/config.yml" "$work_dir/orig-home.yml"
+rc=0
+out="$(run_setup demo-tunnel)" || rc=$?
+assert_eq "setup with an existing config exits 3" "3" "$rc"
+assert_eq "setup leaves the existing config untouched" "same" \
+    "$(cmp -s "$work_dir/orig-home.yml" "$work_dir/home/.cloudflared/config.yml" && echo same || echo changed)"
+assert_not_contains "setup does not claim completion" "Setup complete" "$out"
+assert_contains "setup prints what to do" "credentials-file: $work_dir/home/.cloudflared/" "$out"
+
+setup; setup_home
+rc=0
+out="$(STUB_CREATE_EXISTS=1 run_setup demo-tunnel)" || rc=$?
+assert_eq "setup on an existing tunnel exits 0" "0" "$rc"
+assert_contains "existing tunnel: ID from 'tunnel info --output json'" \
+    "tunnel: 12345678-90ab-4cde-8f01-234567890abc" "$(cat "$work_dir/home/.cloudflared/config.yml")"
+
+setup; setup_home
+rc=0
+out="$(STUB_CREATE_EXISTS=1 STUB_INFO_NAME=someone-else run_setup demo-tunnel)" || rc=$?
+assert_exit_nonzero "tunnel info for another name is not trusted" "$rc"
+assert_contains "tunnel info mismatch message" "Could not determine tunnel ID" "$out"
+
+setup; setup_home
+printf 'tunnel: old\n' > "$work_dir/etc/config.yml"
+rc=0
+out="$(STUB_SUDO_LOGONLY=1 run_setup demo-tunnel --yes)" || rc=$?
+assert_eq "setup --yes exits 0" "0" "$rc"
+sudo_lines="$(grep '^sudo ' "$stub_log" || true)"
+assert_contains "--yes installs the service" "sudo cloudflared service install" "$sudo_lines"
+backup_at="$(printf '%s\n' "$sudo_lines" | grep -n "^sudo cp -p $work_dir/etc/config.yml $work_dir/etc/config.yml.bak." | cut -d: -f1)"
+copy_at="$(printf '%s\n' "$sudo_lines" | grep -n "^sudo cp $work_dir/home/.cloudflared/config.yml $work_dir/etc/config.yml$" | cut -d: -f1)"
+assert_eq "--yes backs up the existing service config before overwriting" "yes" \
+    "$([ -n "$backup_at" ] && [ -n "$copy_at" ] && [ "$backup_at" -lt "$copy_at" ] && echo yes || echo no)"
+
+setup
+mkdir -p "$work_dir/home" "$work_dir/etc"
+rc=0
+out="$(run_setup demo-tunnel)" || rc=$?
+assert_contains "setup without cert.pem logs in first" "cloudflared tunnel login" "$(cat "$stub_log")"
+
+echo
 echo "=== install.sh edge cases ==="
 # install.sh creates a symlink in $HOME/.claude/skills/. Run it in an isolated
 # fake HOME so the real ~/.claude/skills/ directory is untouched.
@@ -1176,6 +1407,33 @@ out="$(HOME="$fake_home" bash "$REPO_ROOT/install.sh" 2>&1)" || rc=$?
 assert_exit_nonzero "install.sh refuses to clobber regular file" "$rc"
 assert_contains "install.sh names the conflicting file" "regular file" "$out"
 rm -rf "$fake_home"
+
+# Clean environment: fresh HOME, no cloudflared anywhere on PATH, no system
+# config. The installed skill must resolve, and detection must say "no
+# tunnel" (exit 1) - not crash and not claim a tunnel.
+setup
+fake_home="$work_dir/clean-home"
+mkdir -p "$fake_home" "$work_dir/no-etc" "$work_dir/nocf-bin"
+for tool in cat dirname id readlink basename mktemp rm date env awk sed grep diff; do
+    t="$(command -v "$tool" 2>/dev/null)" && ln -s "$t" "$work_dir/nocf-bin/$tool"
+done
+for tool in systemctl pgrep sudo ps; do
+    ln -s "$stub_dir/$tool" "$work_dir/nocf-bin/$tool"
+done
+HOME="$fake_home" bash "$REPO_ROOT/install.sh" >/dev/null 2>&1 || true
+skill="$fake_home/.claude/skills/cloudflare-tunnel-routes"
+assert_eq "clean HOME: installed skill resolves to the repo" "yes" \
+    "$([ -f "$skill/scripts/detect.sh" ] && [ -f "$skill/SKILL.md" ] && echo yes || echo no)"
+rc=0
+out="$(HOME="$fake_home" PATH="$work_dir/nocf-bin" CFTR_SYSTEM_DIR="$work_dir/no-etc" \
+    "$BASH" "$skill/scripts/detect.sh" 2>&1 </dev/null)" || rc=$?
+assert_eq "clean HOME: detect.sh exits 1 (no tunnel)" "1" "$rc"
+assert_contains "clean HOME: detect.sh reports no binary" "binary=" "$out"
+rc=0
+out="$(HOME="$fake_home" PATH="$work_dir/nocf-bin" CFTR_SYSTEM_DIR="$work_dir/no-etc" \
+    "$BASH" "$skill/scripts/add-route.sh" app.example.com 8080 --dry-run 2>&1 </dev/null)" || rc=$?
+assert_exit_nonzero "clean HOME: add-route stops" "$rc"
+assert_contains "clean HOME: add-route says no tunnel" "No cloudflared tunnel detected" "$out"
 
 # --- summary ---------------------------------------------------------------
 

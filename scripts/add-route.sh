@@ -174,12 +174,15 @@ detect_out="$(bash "$SCRIPT_DIR/detect.sh")" || {
     rc=$?
     if [ "$rc" = "2" ]; then
         echo "ERROR: detect.sh refused to emit values - config may be tampered." >&2
+    elif [ "$rc" = "3" ]; then
+        : # detect.sh already printed the "needs root" error
     else
         echo "ERROR: No cloudflared tunnel detected." >&2
         echo "Run setup-new-tunnel.sh to create one first." >&2
     fi
     exit 1
 }
+# shellcheck disable=SC2034  # every key is parsed; not all are used here
 while IFS='=' read -r k v; do
     case "$k" in
         binary)       binary="$v" ;;
@@ -225,6 +228,7 @@ on_exit() {
     [ -n "$tmp" ] && rm -f -- "$tmp"
     [ -n "$dns_log" ] && rm -f -- "$dns_log"
     [ -n "$staged" ] && $SUDO rm -f -- "$staged"
+    cftr_lock_release
     if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ "$dns_done" = "true" ] && [ "$host_known" = "false" ]; then
         echo >&2
         echo "NOTE: the DNS CNAME for $hostname was created, but the config change did not go live." >&2
@@ -234,6 +238,14 @@ on_exit() {
     return "$rc"
 }
 trap on_exit EXIT
+
+# A real run holds an exclusive lock from the first read of the config to
+# the restart, so two concurrent runs can never interleave their edits.
+# Running "$binary" as root (validate) needs a trustworthy binary.
+if [ "$dry_run" != "true" ]; then
+    cftr_check_binary || exit 1
+    cftr_lock_acquire || exit 1
+fi
 
 # Sanity check: the insertion pivots on a SINGLE catch-all line. With zero
 # or several, the edit would silently no-op (an unchanged file still passes

@@ -85,6 +85,67 @@ cftr_file_meta() {
     $SUDO stat -L -c '%u %g %a' "$1" 2>/dev/null || $SUDO stat -L -f '%u %g %Lp' "$1"
 }
 
+# cftr_check_binary
+# With sudo in play, "$binary" runs as root, so it must be a root-owned
+# file that nobody else can rewrite. Otherwise anyone able to write the
+# binary (or swap a symlink it resolves through) gets root on the next
+# run. CFTR_TRUST_BINARY=1 skips this - for the test suite ONLY, whose
+# stub binary is necessarily user-owned.
+cftr_check_binary() {
+    [ -n "$SUDO" ] || return 0
+    [ "${CFTR_TRUST_BINARY:-}" = "1" ] && return 0
+    local real meta uid gid mode
+    real="$(cftr_real_path "$binary")" || real=""
+    meta="$( [ -n "$real" ] && cftr_file_meta "$real")" || meta=""
+    read -r uid gid mode <<<"$meta"
+    if [ -z "$meta" ] || [ "$uid" != "0" ] || (( 8#$mode & 8#022 )); then
+        echo "ERROR: refusing to run $binary as root: ${real:-it} must be owned by root" >&2
+        echo "       and not group/world-writable (found: ${meta:-unreadable})." >&2
+        return 1
+    fi
+}
+
+# Lock against concurrent runs on the same config: flock on
+# "${config_file}.lock" when flock exists (opened READ-only, so root and
+# non-root runs share it), else an atomic mkdir of "${config_file}.lock.d"
+# (macOS has no flock). Waits ~3s, then fails with a clear message.
+# CFTR_LOCK_IMPL=mkdir forces the fallback - for the test suite ONLY.
+cftr_lock_kind=""
+cftr_lock_acquire() {
+    local lock_file="${config_file}.lock" lock_dir="${config_file}.lock.d" tries=0
+    if [ "${CFTR_LOCK_IMPL:-}" != "mkdir" ] && command -v flock >/dev/null 2>&1; then
+        if ! $SUDO test -e "$lock_file"; then
+            $SUDO touch "$lock_file" && $SUDO chmod 0644 "$lock_file" || return 1
+        fi
+        exec 9<"$lock_file" || return 1
+        if ! flock -w 3 9; then
+            exec 9<&-
+            echo "ERROR: another cftr run holds the lock on $config ($lock_file)." >&2
+            echo "       Wait for it to finish, then retry." >&2
+            return 1
+        fi
+        cftr_lock_kind="flock"
+    else
+        until $SUDO mkdir "$lock_dir" 2>/dev/null; do
+            tries=$((tries + 1))
+            if [ "$tries" -gt 3 ]; then
+                echo "ERROR: another cftr run holds the lock on $config ($lock_dir)." >&2
+                echo "       If no other run is active (crashed run), remove that directory and retry." >&2
+                return 1
+            fi
+            sleep 1
+        done
+        cftr_lock_kind="mkdir"
+    fi
+}
+cftr_lock_release() {
+    case "$cftr_lock_kind" in
+        flock) exec 9<&- ;;
+        mkdir) $SUDO rmdir -- "${config_file}.lock.d" 2>/dev/null || true ;;
+    esac
+    cftr_lock_kind=""
+}
+
 # cftr_stage <src> <uid> <gid> <mode>
 # Copy <src> into a fresh temp file NEXT TO $config (same filesystem, so
 # the final mv is an atomic rename) with the given owner/group/mode, and

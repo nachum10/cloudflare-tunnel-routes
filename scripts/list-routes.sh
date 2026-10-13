@@ -12,11 +12,14 @@ detect_out="$(bash "$SCRIPT_DIR/detect.sh")" || {
     rc=$?
     if [ "$rc" = "2" ]; then
         echo "ERROR: detect.sh refused to emit values - config may be tampered." >&2
+    elif [ "$rc" = "3" ]; then
+        : # detect.sh already printed the "needs root" error
     else
         echo "ERROR: No cloudflared tunnel detected. Run setup-new-tunnel.sh first." >&2
     fi
     exit 1
 }
+# shellcheck disable=SC2034  # every key is parsed; not all are used here
 while IFS='=' read -r k v; do
     case "$k" in
         binary)       binary="$v" ;;
@@ -28,8 +31,10 @@ while IFS='=' read -r k v; do
     esac
 done <<<"$detect_out"
 
+# Read-only: sudo only if the file itself is unreadable (needs_sudo can be
+# true just because the directory is not writable).
 reader="cat"
-if [ "$needs_sudo" = "true" ]; then
+if [ ! -r "$config" ]; then
     reader="sudo cat"
 fi
 
