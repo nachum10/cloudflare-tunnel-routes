@@ -82,6 +82,35 @@ assert_not_contains() {
     fi
 }
 
+# Line-anchored check: the needle text may legitimately appear INSIDE a
+# comment line, so plain substring matching can't tell "emitted as a real
+# YAML line" apart from "quoted harmlessly in a comment".
+assert_no_line_matching() {
+    local name="$1" ere="$2" hay="$3"
+    if printf '%s\n' "$hay" | grep -qE -- "$ere"; then
+        printf '  FAIL  %s\n' "$name" >&2
+        printf '    expected NO line matching: %s\n' "$ere" >&2
+        printf '    actual:\n%s\n' "$hay" >&2
+        FAIL=$((FAIL + 1))
+    else
+        printf '  PASS  %s\n' "$name"
+        PASS=$((PASS + 1))
+    fi
+}
+
+assert_has_line() {
+    local name="$1" line="$2" hay="$3"
+    if printf '%s\n' "$hay" | grep -qxF -- "$line"; then
+        printf '  PASS  %s\n' "$name"
+        PASS=$((PASS + 1))
+    else
+        printf '  FAIL  %s\n' "$name" >&2
+        printf '    expected exact line: %s\n' "$line" >&2
+        printf '    actual:\n%s\n' "$hay" >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 assert_exit_nonzero() {
     local name="$1" rc="$2"
     if [ "$rc" -ne 0 ]; then
@@ -530,6 +559,101 @@ rc=0
 long="$(printf 'x%.0s' {1..201})"
 out="$(run_add app.example.com 8080 --comment "$long" --dry-run 2>&1)" || rc=$?
 assert_exit_nonzero "rejects overlong --comment" "$rc"
+
+echo
+echo "=== security: YAML line breaks beyond LF / CR ==="
+setup
+write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - service: http_status:404
+EOF
+# YAML also breaks lines on LS (U+2028), PS (U+2029) and NEL (U+0085).
+# Each payload would otherwise hide an extra ingress rule inside what looks
+# like a single comment line.
+ls_char="$(printf '\342\200\250')"
+ps_char="$(printf '\342\200\251')"
+nel_char="$(printf '\302\205')"
+for sep_name in LS PS NEL; do
+    case "$sep_name" in
+        LS)  sep="$ls_char" ;;
+        PS)  sep="$ps_char" ;;
+        NEL) sep="$nel_char" ;;
+    esac
+    payload="x${sep}  - hostname: evil.example.com${sep}    service: http://169.254.169.254"
+    rc=0
+    out="$(run_add app.example.com 8080 --comment "$payload" --dry-run 2>&1)" || rc=$?
+    assert_exit_nonzero "rejects $sep_name in --comment" "$rc"
+    assert_contains "$sep_name-in-comment message" "printable ASCII" "$out"
+done
+
+rc=0
+out="$(run_add app.example.com 8080 --path "/x${ls_char}evil" --dry-run 2>&1)" || rc=$?
+assert_exit_nonzero "rejects U+2028 in --path" "$rc"
+rc=0
+out="$(run_add app.example.com 8080 --path "/caf$(printf '\303\251')" --dry-run 2>&1)" || rc=$?
+assert_exit_nonzero "rejects non-ASCII --path" "$rc"
+assert_contains "non-ASCII path message" "printable ASCII" "$out"
+
+echo
+echo "=== security: no awk -v escape processing ==="
+setup
+write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - service: http_status:404
+EOF
+# Literal backslash-n (two chars) in --comment: awk -v would turn it into
+# a real newline and emit a second, attacker-controlled ingress rule.
+rc=0
+out="$(run_add app.example.com 8080 \
+    --comment 'hi\n  - hostname: evil.example.com\n    service: ssh://localhost:22' \
+    --dry-run 2>&1)" || rc=$?
+if [ "$rc" -eq 0 ]; then
+    assert_contains "literal \\n comment kept on one line" \
+        '| hi\n  - hostname: evil.example.com\n    service: ssh://localhost:22' "$out"
+fi
+assert_no_line_matching "literal \\n comment adds no rule" \
+    '^[[:space:]]*- hostname: evil\.example\.com' "$out"
+assert_no_line_matching "literal \\n comment adds no ssh service" \
+    '^[[:space:]]*service: ssh://' "$out"
+
+# Octal escapes in --path (\012 newline, \040 space, \072 colon) slip past
+# the whitespace / ':' filter and would be decoded by awk -v.
+rc=0
+out="$(run_add app.example.com 8080 \
+    --path '/x\012\040\040-\040hostname\072\040evil.example.com\012\040\040\040\040service\072\040ssh\072//localhost\07222' \
+    --dry-run 2>&1)" || rc=$?
+assert_no_line_matching "octal --path adds no rule" \
+    '^[[:space:]]*- hostname: evil\.example\.com' "$out"
+assert_no_line_matching "octal --path adds no ssh service" \
+    '^[[:space:]]*service: ssh://' "$out"
+
+# A regex path with an escaped dot must reach the config byte-for-byte
+# (gawk/busybox -v would rewrite `\.` to `.`, changing the route's meaning).
+out="$(run_add app.example.com 8080 --path '/static/.*\.css' --dry-run)"
+assert_has_line "regex path with \\. round-trips byte-exact" '    path: /static/.*\.css' "$out"
+out="$(run_add app.example.com 8080 --path '/static/.*\.css' --diff)"
+assert_has_line "regex path with \\. byte-exact in --diff" '+    path: /static/.*\.css' "$out"
+
+# Duplicate detection / removal must compare the same unescaped bytes.
+write_fixture <<'EOF'
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /tmp/x.json
+ingress:
+  - hostname: app.example.com
+    path: /static/.*\.css
+    service: http://127.0.0.1:8080
+  - service: http_status:404
+EOF
+out="$(run_add app.example.com 8080 --path '/static/.*\.css' --dry-run)"
+assert_contains "duplicate detected for path with \\." "already exists" "$out"
+out="$(run_remove app.example.com --path '/static/.*\.css' --dry-run)"
+assert_not_contains "remove --path with \\. finds the block" "no matching entry" "$out"
+assert_not_contains "remove --path with \\. drops the block" 'path: /static/' "$out"
+assert_contains "remove --path with \\. keeps catch-all" "http_status:404" "$out"
 
 echo
 echo "=== formatting: hand-crafted exotic configs ==="

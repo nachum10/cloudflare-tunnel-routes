@@ -59,7 +59,8 @@ tunnel_id="$(cloudflared tunnel list -o json 2>/dev/null \
 
 if [ -z "$tunnel_id" ]; then
     # Fallback: parse from text output
-    tunnel_id="$(cloudflared tunnel list 2>/dev/null | awk -v n="$tunnel_name" '$2 == n {print $1}')"
+    # ENVIRON instead of `awk -v`, which would process backslash escapes.
+    tunnel_id="$(cloudflared tunnel list 2>/dev/null | cftr_name="$tunnel_name" awk '$2 == ENVIRON["cftr_name"] {print $1}')"
 fi
 
 if [ -z "$tunnel_id" ]; then

@@ -123,7 +123,10 @@ tmp="$(mktemp)"
 # AWK: walk blocks of `- hostname: X` ... up to next `- hostname:` or end-of-list.
 # Skip the block if hostname matches AND (no --path given OR path matches).
 # After a skip, also swallow one trailing blank line so config stays tidy.
-$SUDO awk -v h="$hostname" -v p="$path" '
+# Values go through ENVIRON, not `awk -v`: -v processes backslash escapes,
+# so a path like /static/.*\.css would never match its own config entry.
+$SUDO env cftr_host="$hostname" cftr_path="$path" awk '
+    BEGIN { h = ENVIRON["cftr_host"]; p = ENVIRON["cftr_path"] }
     function flush() {
         if (skip) {
             skip = 0; n = 0

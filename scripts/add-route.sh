@@ -94,13 +94,19 @@ fi
 
 # Comment: optional, opt-in only. Reject newlines (which would break out of
 # the comment line in YAML) and cap length so a stray paragraph doesn't end
-# up inline.
+# up inline. Beyond \n and \r, YAML parsers also break lines on NEL (U+0085),
+# LS (U+2028) and PS (U+2029), so a "single-line" comment could still smuggle
+# in a hidden ingress rule. Allow printable ASCII only ([[:print:]] under
+# LC_ALL=C is 0x20-0x7E): no control chars, no bytes >= 0x80.
 if [ -n "$comment" ]; then
     case "$comment" in
         *$'\n'*|*$'\r'*)
             echo "ERROR: --comment cannot contain newlines." >&2; exit 1
             ;;
     esac
+    if ! [[ "$comment" =~ ^[[:print:]]+$ ]]; then
+        echo "ERROR: --comment must be printable ASCII (no control or non-ASCII characters)." >&2; exit 1
+    fi
     if [ "${#comment}" -gt 200 ]; then
         echo "ERROR: --comment too long (>200 chars). Keep it short." >&2; exit 1
     fi
@@ -110,7 +116,8 @@ fi
 # allow regex/glob metacharacters (.*, +, ?, [, ], etc.). Validate by
 # rejecting only what would break the YAML emission or be otherwise
 # nonsensical: control chars, whitespace, quotes, '#' (yaml comment),
-# ':' (yaml key separator).
+# ':' (yaml key separator), and anything outside printable ASCII (YAML
+# treats NEL / U+2028 / U+2029 as line breaks, same as in --comment).
 if [ -n "$path" ]; then
     if [[ "$path" != /* ]]; then
         echo "ERROR: --path must start with /" >&2; exit 1
@@ -126,6 +133,10 @@ if [ -n "$path" ]; then
             exit 1
             ;;
     esac
+    if ! [[ "$path" =~ ^[[:print:]]+$ ]]; then
+        echo "ERROR: invalid --path: must be printable ASCII (no control or non-ASCII characters)." >&2
+        exit 1
+    fi
 fi
 
 # Target: bare port number, full http(s) URL, or host:port. Reject anything
@@ -260,9 +271,15 @@ fi
 # Check if hostname (with same path) already exists.
 # Match by exact string comparison on the parsed YAML field, NEVER by
 # interpolating $hostname into the awk regex source.
+# Values reach awk through the environment (ENVIRON), NEVER via `awk -v`:
+# -v processes backslash escapes (\n, \040, and `\.` -> `.` in gawk/busybox),
+# which would let a --path / --comment smuggle in extra YAML lines and would
+# silently rewrite regex paths like /static/.*\.css. `$SUDO env` keeps the
+# vars across sudo's env_reset.
 already_present="false"
 if [ -n "$path" ]; then
-    if $SUDO awk -v h="$hostname" -v p="$path" '
+    if $SUDO env cftr_host="$hostname" cftr_path="$path" awk '
+        BEGIN { h = ENVIRON["cftr_host"]; p = ENVIRON["cftr_path"] }
         /^[[:space:]]*-[[:space:]]*hostname:/ {
             cur = $NF; gsub(/["'"'"']/, "", cur)
             in_block = (cur == h)
@@ -278,7 +295,8 @@ if [ -n "$path" ]; then
         already_present="true"
     fi
 else
-    if $SUDO awk -v h="$hostname" '
+    if $SUDO env cftr_host="$hostname" awk '
+        BEGIN { h = ENVIRON["cftr_host"] }
         /^[[:space:]]*-[[:space:]]*hostname:/ {
             if (in_block && !saw_path) { found = 1; exit }
             cur = $NF; gsub(/["'"'"']/, "", cur)
@@ -306,9 +324,10 @@ else
     echo "==> Inserting ingress block before catch-all..."
     # Insert the new block immediately before the line containing "service: http_status:404"
     tmp="$(mktemp)"
-    $SUDO awk -v block="$new_block" '
+    # Block passed via ENVIRON, not -v (see duplicate check above).
+    $SUDO env cftr_block="$new_block" awk '
         /service:[[:space:]]*http_status:404/ {
-            n = split(block, lines, "\n")
+            n = split(ENVIRON["cftr_block"], lines, "\n")
             for (i=1; i<=n; i++) print lines[i]
         }
         { print }
