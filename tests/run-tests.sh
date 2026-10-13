@@ -50,6 +50,14 @@ write_stubs() {
     cat > "$stub_dir/cloudflared" <<'STUB'
 #!/usr/bin/env bash
 echo "cloudflared $*" >> "$(dirname "$0")/../stub.log"
+# STUB_TOUCH_ON=dns|validate + STUB_TOUCH_FILE: simulate someone editing
+# the live config while that step runs.
+if [ -n "${STUB_TOUCH_FILE:-}" ]; then
+    case "${STUB_TOUCH_ON:-}:$*" in
+        dns:*"tunnel route dns"*|validate:*"ingress validate"*)
+            echo "# edited by hand meanwhile" >> "$STUB_TOUCH_FILE" ;;
+    esac
+fi
 case " $* " in
     *" tunnel route dns "*)
         if [ -n "${STUB_DNS_CONFLICT:-}" ]; then
@@ -1341,6 +1349,32 @@ out="$(CFTR_LOCK_IMPL="mkdir" run_remove keep.example.com --keep-dns)" || rc=$?
 assert_eq "mkdir lock free -> remove-route succeeds" "0" "$rc"
 assert_eq "mkdir lock removed on exit" "absent" \
     "$([ -e "$work_dir/config.yml.lock.d" ] && echo present || echo absent)"
+
+# Lock only stops other cftr runs: a hand edit between our first read and
+# the swap must not be overwritten (checksum before swap).
+setup; apply_fixture
+rc=0
+out="$(STUB_TOUCH_ON=validate STUB_TOUCH_FILE="$work_dir/config.yml" run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "edit during validate -> add stops" "$rc"
+assert_contains "edit during validate -> clear message" "changed while this run was working on it" "$out"
+assert_not_contains "edit during validate -> no DNS call" "route dns" "$(cat "$stub_log")"
+assert_contains "edit during validate -> hand edit kept" "edited by hand meanwhile" "$(cat "$work_dir/config.yml")"
+assert_not_contains "edit during validate -> our block not written" "app.example.com" "$(cat "$work_dir/config.yml")"
+
+setup; apply_fixture
+rc=0
+out="$(STUB_TOUCH_ON=dns STUB_TOUCH_FILE="$work_dir/config.yml" run_add app.example.com 8080)" || rc=$?
+assert_exit_nonzero "edit during DNS -> add stops before the swap" "$rc"
+assert_contains "edit during DNS -> hand edit kept" "edited by hand meanwhile" "$(cat "$work_dir/config.yml")"
+assert_not_contains "edit during DNS -> our block not written" "app.example.com" "$(cat "$work_dir/config.yml")"
+assert_not_contains "edit during DNS -> nothing restarted" "systemctl restart" "$(cat "$stub_log")"
+
+setup; apply_fixture
+rc=0
+out="$(STUB_TOUCH_ON=validate STUB_TOUCH_FILE="$work_dir/config.yml" run_remove keep.example.com --keep-dns)" || rc=$?
+assert_exit_nonzero "edit during validate -> remove stops" "$rc"
+assert_contains "edit during validate -> remove keeps the route" "keep.example.com" "$(cat "$work_dir/config.yml")"
+assert_contains "edit during validate -> remove keeps the hand edit" "edited by hand meanwhile" "$(cat "$work_dir/config.yml")"
 
 echo
 echo "=== idempotency: same command twice ==="

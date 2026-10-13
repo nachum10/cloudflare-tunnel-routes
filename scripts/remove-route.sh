@@ -137,6 +137,7 @@ if [ "$dry_run" != "true" ]; then
     cftr_check_sudo || exit 1
     cftr_check_binary || exit 1
     cftr_lock_acquire || exit 1
+    cftr_remember_config || exit 1
 fi
 
 [ "$dry_run" = "true" ] && echo "==> DRY RUN: no changes will be made"
@@ -222,6 +223,7 @@ backup="$(cftr_backup)" || {
 }
 echo "==> Backed up config to $backup"
 cftr_rotate_backups
+cftr_assert_config_unchanged || exit 1
 $SUDO mv -f -- "$staged" "$config_file"
 staged=""
 echo "    Removed."

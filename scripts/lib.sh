@@ -163,6 +163,27 @@ cftr_lock_release() {
     cftr_lock_kind=""
 }
 
+# The lock only stops other cftr runs. A hand edit (or another tool) can
+# still change the config between our first read and the swap; that edit
+# would be silently lost. Fingerprint the config right after taking the
+# lock and refuse to swap if it changed.
+cftr_fingerprint() {
+    $RSUDO cat -- "$config_file" | cksum
+}
+cftr_config_fp=""
+cftr_remember_config() {
+    cftr_config_fp="$(cftr_fingerprint)"
+}
+cftr_assert_config_unchanged() {
+    local now
+    now="$(cftr_fingerprint)" || now=""
+    if [ -z "$cftr_config_fp" ] || [ "$now" != "$cftr_config_fp" ]; then
+        echo "ERROR: $config changed while this run was working on it (edited by hand or" >&2
+        echo "       another tool?). Nothing was replaced; re-run to apply on top of the new content." >&2
+        return 1
+    fi
+}
+
 # cftr_stage <src> <uid> <gid> <mode>
 # Copy <src> into a fresh temp file NEXT TO $config (same filesystem, so
 # the final mv is an atomic rename) with the given owner/group/mode, and

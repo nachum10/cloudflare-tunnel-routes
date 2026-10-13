@@ -34,7 +34,7 @@ A security-hardening release. If you drive the scripts from automation or an AI 
 
 - `CFTR_SERVICE=<unit>` names the systemd unit to restart. Without it, the scripts restart only the unit whose `ExecStart` passes this config as `--config <file>`.
 - `detect.sh` keys `service_unit`, `service_candidates`, `remote_managed`; a warning when the unit runs `tunnel run --token` (remotely-managed tunnel: local ingress is ignored).
-- Per-config locking for every mutating run (`flock` on `config.yml.lock`, or a `config.yml.lock.d` directory where `flock` is missing). A second concurrent run fails within ~3 s with "another cftr run holds the lock".
+- Per-config locking for every mutating run (`flock` on `config.yml.lock`, or a `config.yml.lock.d` directory where `flock` is missing). A second concurrent run fails within ~3 s with "another cftr run holds the lock". On top of the lock, the config is checksummed right after it is taken and checked again before DNS and before the swap: if anything else (a hand edit, another tool) changed the file meanwhile, the run stops without replacing it, so that edit is never lost.
 - Path shadowing protection: a new `--path` rule for a hostname that already has a host-only rule is inserted above that rule (and its comment lines), so it is reachable.
 - `setup-new-tunnel.sh --yes` installs the systemd service without prompting.
 - Shared helpers in `scripts/lib.sh`; a hermetic stub harness in the test suite (200+ tests) with a call log and failure injection.

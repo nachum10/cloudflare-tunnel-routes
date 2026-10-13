@@ -253,6 +253,7 @@ if [ "$dry_run" != "true" ]; then
     cftr_check_sudo || exit 1
     cftr_check_binary || exit 1
     cftr_lock_acquire || exit 1
+    cftr_remember_config || exit 1
 fi
 
 # Sanity check: the insertion pivots on a SINGLE catch-all line. With zero
@@ -375,6 +376,9 @@ else
     fi
 fi
 
+# The config must not have changed under us since the first read.
+cftr_assert_config_unchanged || exit 1
+
 # Create the DNS CNAME. Any non-zero exit is a failure - including the
 # "An A, AAAA, or CNAME record with that host already exists" CONFLICT,
 # where the name points somewhere else. (A record already routed to THIS
@@ -413,6 +417,7 @@ backup="$(cftr_backup)" || {
 }
 echo "==> Backed up config to $backup"
 cftr_rotate_backups
+cftr_assert_config_unchanged || exit 1
 $SUDO mv -f -- "$staged" "$config_file"
 staged=""
 echo "==> Config updated."
